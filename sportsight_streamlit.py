@@ -9,71 +9,47 @@ import streamlit as st
 import folium
 from streamlit.components.v1 import html
 
-# --- Optional imports (guarded) ---
-try:
-    import RPi.GPIO as GPIO  # Raspberry Pi only
-except Exception:
-    GPIO = None
 
-try:
-    from smbus2 import SMBus
-except Exception:
-    SMBus = None
-
-try:
-    import serial, pynmea2
-except Exception:
-    serial = None
-    pynmea2 = None
-
-try:
-    import speech_recognition as sr  # Google Web Speech API
-except Exception:
-    sr = None
-
-try:
-    from gtts import gTTS
-except Exception:
-    gTTS = None
-
-try:
-    import requests
-except Exception:
-    requests = None
-
-# Styling Dark Mode for Streamlit UI
-def local_css():
-    st.markdown(
-        """
-        <style>
-        body, .stApp {
-            background-color: #0E1117;
-            color: #FAFAFA;
-            font-family: 'Poppins', sans-serif;
-        }
-        div[data-testid="metric-container"] {
-            background-color: #1E222A;
-            border-radius: 15px;
-            padding: 16px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.4);
-            margin-bottom: 15px;
-        }
-        div[data-testid="metric-container"] label {
-            color: #00eaff !important;
-            font-weight: bold;
-        }
-        div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
-            color: #ffffff !important;
-            font-size: 24px;
-            font-weight: bold;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-local_css()
+# Styling for Streamlit UI
+# def local_css():
+#     st.markdown(
+#         """
+#         <style>
+#         body, .stApp {
+#             background-color: #FFFFFF;
+#             color: #FAFAFA;
+#             font-family: 'Poppins', sans-serif;
+#         }
+#         div[data-testid="metric-container"] {
+#             background-color: #1E222A;
+#             border-radius: 15px;
+#             padding: 16px;
+#             box-shadow: 0 2px 10px rgba(0,0,0,0.4);
+#             margin-bottom: 15px;
+#         }
+#         div[data-testid="metric-container"] label {
+#             color: #00eaff !important;
+#             font-weight: bold;
+#         }
+#         div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
+#             color: #000000 !important;
+#             font-size: 24px;
+#             font-weight: bold;
+#         }
+#         </style>
+#         """,
+#         unsafe_allow_html=True
+#     )
+# local_css()
 
 st.set_page_config(page_title="SportSight Dashboard", page_icon="🏃", layout="wide")
+
+# --- Init session_state variables ---
+if "history" not in st.session_state:
+    st.session_state["history"] = []
+if "dummy_merdeka_loaded" not in st.session_state:
+    st.session_state["dummy_merdeka_loaded"] = False
+
 
 # Sidebar Controls
 st.sidebar.markdown("<div class='brand brand-grad'>SportSight</div>", unsafe_allow_html=True)
@@ -91,7 +67,15 @@ TARGET_LON = st.sidebar.text_input("Target Lon", "106.8166")
 SAFETY_DISTANCE_M = st.sidebar.slider("Safety distance (m)", 0.5, 5.0, 2.0, 0.1)
 
 # Queues & State
-ultra_q, imu_q, gps_q, log_q = queue.Queue(1), queue.Queue(1), queue.Queue(1), queue.Queue(200)
+log_q = queue.Queue(200)
+
+if SIMULATE:
+    from dummy import ultra_q, imu_q, gps_q, start_simulation as start_sim
+else:
+    ultra_q, imu_q, gps_q = queue.Queue(1), queue.Queue(1), queue.Queue(1)
+    def start_sim():  # dummy fungsi agar tidak error
+        pass
+    
 
 def add_log(text: str):
     ts = time.strftime("%H:%M:%S")
@@ -223,107 +207,72 @@ def gps_worker(sim=SIMULATE):
 # Start sensor threads once
 if "_threads" not in st.session_state:
     st.session_state["_threads"] = True
-    threading.Thread(target=hcsr_worker, daemon=True).start()
-    threading.Thread(target=mpu_worker, daemon=True).start()
-    threading.Thread(target=gps_worker, daemon=True).start()
+    if SIMULATE:
+        start_sim()  # Menjalankan worker dari dummy.py
+    else:
+        threading.Thread(target=hcsr_worker, daemon=True).start()
+        threading.Thread(target=mpu_worker, daemon=True).start()
+        threading.Thread(target=gps_worker, daemon=True).start()
+
 
 # Header
 colH1, colH2 = st.columns([3,1])
 with colH1:
-    st.markdown("<div class='brand brand-grad'>🏃‍♂️ SportSight — AI Running Assistant</div>", unsafe_allow_html=True)
+    st.title("🏃‍♂️ SportSight — AI Running Assistant")
     st.markdown("<span class='muted'>Deteksi rintangan, orientasi, arahan rute, perintah suara, respons AI, dan TTS.</span>", unsafe_allow_html=True)
-with colH2:
-    st.markdown("<div class='glass'>" + ''.join([f"<span class='tag'>STT</span>", f"<span class='tag'>TTS</span>", f"<span class='tag'>GPS</span>"]) + "</div>", unsafe_allow_html=True)
-
 st.write("")
 
-# Controls Row
-col1, col2, col3 = st.columns([1.5,1.5,1])
-with col1:
-    if st.button("🎙️ Dengarkan Perintah"):
-        cmd = listen_google()
-        if cmd:
-            reply = generate_reply(cmd)
-            st.session_state["last_cmd"] = cmd
-            st.session_state["last_ai"] = reply
-            speak(reply)
-
-with col2:
-    if st.button("🗣️ Ucapkan Status"):
-        dist = ultra_q.queue[0] if not ultra_q.empty() else None
-        pos = gps_q.queue[0] if not gps_q.empty() else None
-        yaw, pitch, roll = imu_q.queue[0] if not imu_q.empty() else (0,0,0)
-        msg = []
-        if dist is not None:
-            msg.append(f"Rintangan {dist:.1f} meter di depan.")
-        if pos is not None:
-            msg.append(f"Lokasi {pos[0]:.5f}, {pos[1]:.5f}.")
-        msg.append(f"Orientasi yaw {yaw:.0f} derajat.")
-        speak(" ".join(msg))
-
-with col3:
-    if st.button("🧭 Arahin ke Target"):
-        if gps_q.empty():
-            speak("Data GPS belum siap.")
-        else:
-            lat, lon = gps_q.queue[0]
-            try:
-                tgt_lat = float(TARGET_LAT)
-                tgt_lon = float(TARGET_LON)
-                def calc_bearing(lat1, lon1, lat2, lon2):
-                    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-                    dlon = math.radians(lon2 - lon1)
-                    x = math.sin(dlon) * math.cos(phi2)
-                    y = math.cos(phi1)*math.sin(phi2) - math.sin(phi1)*math.cos(phi2)*math.cos(dlon)
-                    brng = (math.degrees(math.atan2(x, y)) + 360) % 360
-                    return brng
-                bearing = calc_bearing(lat, lon, tgt_lat, tgt_lon)
-                speak(f"Arahkan badan ke {bearing:.0f} derajat dan maju.")
-            except Exception:
-                speak("Koordinat target tidak valid.")
-
-# Sensor Status and AI Conversation UI
-info_col = st.columns([1])[0]
-with info_col:
-    st.markdown("<div class='glass'>", unsafe_allow_html=True)
-    st.markdown("#### Status Sensor")
-    dist = ultra_q.queue[0] if not ultra_q.empty() else float('nan')
-    yaw, pitch, roll = imu_q.queue[0] if not imu_q.empty() else (float('nan'),) * 3
-    gps = gps_q.queue[0] if not gps_q.empty() else (float('nan'), float('nan'))
-
-    st.metric("Jarak depan (m)", f"{dist:0.2f}" if not math.isnan(dist) else "—")
-    st.metric("Yaw (°)", f"{yaw:0.0f}" if not math.isnan(yaw) else "—")
-    st.metric("GPS", f"{gps[0]:.5f}, {gps[1]:.5f}" if not math.isnan(gps[0]) else "—")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='glass'>", unsafe_allow_html=True)
-    st.markdown("#### AI Percakapan")
-    st.write("**Perintah:**", st.session_state.get("last_cmd", "—"))
-    st.write("**AI:**", st.session_state.get("last_ai", "—"))
-    if "last_tts" in st.session_state:
-        st.audio(st.session_state["last_tts"], format='audio/mp3')
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# GPS Route Map
+# GPS Route Map 
 st.markdown("---")
 st.subheader("🗺️ Peta Rute Realtime")
+#Dummy History
+if not st.session_state["dummy_merdeka_loaded"]:
+    base_lat, base_lon = -6.9209, 106.9270  # lapdek
+    base_time = datetime.utcnow()
 
-if not gps_q.empty():
-    gps_data = list(gps_q.queue)
-    gps_points = [(lat, lon) for lat, lon in gps_data if lat and lon]
-else:
-    gps_points = []
+    dummy_points = [
+        (base_lat, base_lon),                         
+        (base_lat+0.0003, base_lon+0.0002),           
+        (base_lat+0.0004, base_lon-0.0001),           
+        (base_lat+0.0002, base_lon-0.0003),           
+        (base_lat, base_lon-0.0004),                  
+        (base_lat-0.0003, base_lon-0.0002),           
+        (base_lat-0.0004, base_lon+0.0001),           
+        (base_lat-0.0002, base_lon+0.0003),           
+        (base_lat, base_lon),                         
+    ]
 
-if gps_points:
-    route_html = generate_route_map(gps_points)
-    if route_html and os.path.exists(route_html):
-        with open(route_html, "r", encoding="utf-8") as f:
-            route_html_code = f.read()
-        html(route_html_code, height=500)
-    else:
-        st.error("Gagal membuat peta rute.")
+    for i, (lat, lon) in enumerate(dummy_points):
+        dist = 1.2 if i in [3, 5] else 3.5  
+        yaw = (i * 35) % 360 if i in [3, 5] else (i * 20) % 360
+
+        st.session_state["history"].append({
+            "ts": base_time.replace(microsecond=0) + pd.Timedelta(seconds=i*20),
+            "distance_m": dist,
+            "yaw": yaw,
+            "gps_lat": lat,
+            "gps_lon": lon,
+            "cmd": None,
+            "ai": None,
+        })
+
+    st.session_state["dummy_merdeka_loaded"] = True
+    st.success("✅ Dummy history lari di Lapangan Merdeka (GPS, jarak, yaw) sudah dimasukkan.")
+    
+if st.session_state.get("history"):
+    gps_points = [
+        (row["gps_lat"], row["gps_lon"]) 
+        for row in st.session_state["history"] 
+        if row["gps_lat"] is not None and row["gps_lon"] is not None
+    ]
+    if gps_points:
+        route_file = generate_route_map(gps_points)
+        if route_file:
+            with open(route_file, "r", encoding="utf-8") as f:
+                st.components.v1.html(f.read(), height=500)
 else:
     st.info("Belum ada data GPS untuk ditampilkan.")
+
 
 # Dashboard Statistik
 st.subheader("📊 Statistik Sensor & AI (Realtime)")
@@ -350,7 +299,8 @@ if "history" not in st.session_state:
     st.session_state["history"] = []
 
 snap = snapshot_state()
-st.session_state["history"].append(snap)
+if snap["distance_m"] is not None or snap["yaw"] is not None or snap["gps_lat"] is not None:
+    st.session_state["history"].append(snap)
 MAX_HISTORY = 200
 if len(st.session_state["history"]) > MAX_HISTORY:
     st.session_state["history"] = st.session_state["history"][-MAX_HISTORY:]
@@ -408,100 +358,6 @@ with metric_col2:
     else:
         st.metric(label="🧭 Yaw Sekarang (°)", value=f"{yaw_last:.2f}", delta=(f"{yaw_delta:+.2f}°" if yaw_delta is not None else "—"))
 
-# AI / Perintah Terakhir
-st.markdown("---")
-st.markdown("**AI / Perintah (Terakhir)**")
-last_cmd = st.session_state.get("last_cmd", "—")
-last_ai = st.session_state.get("last_ai", "—")
-st.write("Perintah:", last_cmd)
-st.write("AI:", last_ai)
 
-# Log Aktivitas Ringkas
-st.markdown("---")
-st.markdown("#### Log Aktivitas (ringkas)")
-logs = list(log_q.queue)
-st.text_area("Log (recent)", value="\n".join(logs[-200:]), height=180)
 
-# MongoDB Cloud Sync
-st.markdown("---")
-st.subheader("☁️ Sinkronisasi ke MongoDB Atlas (Cloud)")
 
-st.info("Untuk menyimpan/ambil data sensor & AI di cloud MongoDB, isi connection string (MongoDB URI) di bawah. Gunakan format: mongodb+srv://<user>:<pass>@cluster0.xyz.mongodb.net/test?retryWrites=true&w=majority")
-
-MONGO_URI = st.text_input("MongoDB URI (mongodb+srv://...)", os.environ.get("MONGO_URI", ""))
-MONGO_DB = st.text_input("Database name", os.environ.get("MONGO_DB", "sportsight_db"))
-MONGO_COLL = st.text_input("Collection name", os.environ.get("MONGO_COLL", "telemetry"))
-
-def get_mongo_client(uri):
-    try:
-        from pymongo import MongoClient
-    except Exception:
-        st.error("pymongo belum terpasang. Jalankan: pip install pymongo dnspython")
-        return None
-    try:
-        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
-        client.admin.command("ping")
-        return client
-    except Exception as e:
-        st.error(f"Gagal koneksi MongoDB: {e}")
-        return None
-
-col1, col2, col3 = st.columns([1,1,1])
-with col1:
-    if st.button("🔁 Kirim snapshot sekarang (Push)"):
-        if not MONGO_URI:
-            st.error("Isi MongoDB URI terlebih dahulu.")
-        else:
-            client = get_mongo_client(MONGO_URI)
-            if client:
-                db = client[MONGO_DB]
-                coll = db[MONGO_COLL]
-                doc = snapshot_state()
-                doc["_ts"] = datetime.utcnow()
-                try:
-                    coll.insert_one(doc)
-                    st.success("Snapshot berhasil disimpan ke MongoDB.")
-                except Exception as e:
-                    st.error(f"Gagal insert: {e}")
-
-with col2:
-    if st.button("📥 Ambil 100 data terakhir (Pull)"):
-        if not MONGO_URI:
-            st.error("Isi MongoDB URI terlebih dahulu.")
-        else:
-            client = get_mongo_client(MONGO_URI)
-            if client:
-                db = client[MONGO_DB]
-                coll = db[MONGO_COLL]
-                try:
-                    docs = list(coll.find().sort("_ts", -1).limit(100))
-                    if docs:
-                        pull_df = pd.DataFrame(docs)
-                        if "distance_m" in pull_df.columns:
-                            st.markdown("Chart jarak dari DB (pulled)")
-                            pull_df = pull_df.set_index("_ts")
-                            st.line_chart(pull_df["distance_m"].astype(float).ffill())
-                        st.dataframe(pull_df.head(50))
-                    else:
-                        st.info("Tidak ada data di collection.")
-                except Exception as e:
-                    st.error(f"Gagal query: {e}")
-
-with col3:
-    if st.button("⚙️ Setup Index & Test"):
-        if not MONGO_URI:
-            st.error("Isi MongoDB URI terlebih dahulu.")
-        else:
-            client = get_mongo_client(MONGO_URI)
-            if client:
-                db = client[MONGO_DB]
-                coll = db[MONGO_COLL]
-                try:
-                    coll.create_index([("_ts", -1)])
-                    coll.create_index([("distance_m", 1)])
-                    st.success("Index dibuat/test OK.")
-                except Exception as e:
-                    st.error(f"Gagal buat index: {e}")
-
-st.markdown("---")
-st.caption("Tip: simpan MONGO_URI di environment variable atau file .env agar tidak menuliskannya ke UI di production.")
