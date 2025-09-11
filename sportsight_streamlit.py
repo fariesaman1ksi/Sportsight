@@ -70,8 +70,6 @@ SAFETY_DISTANCE_M = st.sidebar.slider("Safety distance (m)", 0.5, 5.0, 2.0, 0.1)
 log_q = queue.Queue(200)
 
 if SIMULATE:
-    from dummy import ultra_q, imu_q, gps_q, start_simulation as start_sim
-else:
     ultra_q, imu_q, gps_q = queue.Queue(1), queue.Queue(1), queue.Queue(1)
     def start_sim():  # dummy fungsi agar tidak error
         pass
