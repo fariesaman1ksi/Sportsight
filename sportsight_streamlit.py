@@ -271,6 +271,36 @@ if st.session_state.get("history"):
 else:
     st.info("Belum ada data GPS untuk ditampilkan.")
 
+# --- Deteksi Objek ---
+st.markdown("---")
+st.subheader("🖼️ Deteksi Objek")
+
+# dummy objek
+import os
+
+IMAGE_DIR = "images_dummy"  # folder tempat image dummy
+
+dummy_objects = [
+    {"name": "Tiang", "image": os.path.join(IMAGE_DIR, "tiang.jpg"), "command": "20 meter di depan belok kanan"},
+    {"name": "Orang", "image": os.path.join(IMAGE_DIR, "orang.jpg"), "command": "5 meter di depan belok kanan"},
+]
+
+# tampilkan semua objek yang terdeteksi
+for obj in dummy_objects:
+    st.image(obj["image"], caption=obj["name"], width=200)
+    st.info(f"Perintah AI: {obj['command']}")
+
+    # opsional: simpan ke history agar muncul di dashboard
+    st.session_state["history"].append({
+        "ts": datetime.utcnow(),
+        "distance_m": None,
+        "yaw": None,
+        "gps_lat": None,
+        "gps_lon": None,
+        "cmd": obj["command"],
+        "ai": f"Objek terdeteksi: {obj['name']}"
+    })
+
 
 # Dashboard Statistik
 st.subheader("📊 Statistik Sensor & AI (Realtime)")
@@ -355,7 +385,5 @@ with metric_col2:
         st.metric(label="🧭 Yaw Sekarang (°)", value="—", delta="—")
     else:
         st.metric(label="🧭 Yaw Sekarang (°)", value=f"{yaw_last:.2f}", delta=(f"{yaw_delta:+.2f}°" if yaw_delta is not None else "—"))
-
-
 
 
