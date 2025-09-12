@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 import folium
 from streamlit.components.v1 import html
+import random
 
 
 # Styling for Streamlit UI
@@ -322,7 +323,7 @@ if st.session_state.get("history"):
 
     # isi dummy jika sensor tidak ada
     distance = latest.get("distance_m") if latest.get("distance_m") is not None else 5.0
-    yaw = latest.get("yaw") if latest.get("yaw") is not None else random.uniform(0, 360)
+    yaw = latest.get("yaw") if latest.get("yaw") is not None else ((time.time() * 10) % 360)
     gps_lat = latest.get("gps_lat") if latest.get("gps_lat") is not None else (last_gps["gps_lat"] if last_gps else None)
     gps_lon = latest.get("gps_lon") if latest.get("gps_lon") is not None else (last_gps["gps_lon"] if last_gps else None)
 
