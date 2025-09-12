@@ -1,54 +1,181 @@
 #!/usr/bin/env python3
-# combined.py — Turn-by-turn, reroute, arrival
+# newsportsight.py — STT+LLM+TTS (selalu on), operasi berat (YOLO+Ultrasonic+GPS Nav) start/stop via suara
+
+import os
+import uuid
+import time
+import math
+import re
+import queue
+import threading
+import subprocess
+from collections import deque
 
 import requests
-import folium
+
 import serial
 import pynmea2
 from gtts import gTTS
-import os
-import uuid
 from openai import OpenAI
 from geopy.distance import geodesic
-import math
-import time
-import speech_recognition as sr
 
-import subprocess
 import cv2
 import numpy as np
 import torch
-import threading
-import queue
+import speech_recognition as sr
 import RPi.GPIO as GPIO
-import re
 
-# ========== CONFIG ==========
-api_key = "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"
-client = OpenAI(base_url="https://router.huggingface.co/v1", api_key=api_key)
+# ===== Kompas & IMU =====
+import smbus2  # I2C untuk HMC5883L & MPU6050
 
-API_KEY = "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"
+# --- Alamat I2C & register (HMC5883L + MPU6050) ---
+I2C_BUS = 1
+# HMC5883L
+HMC_ADDR = 0x1E
+REG_CONFIG_A = 0x00
+REG_CONFIG_B = 0x01
+REG_MODE     = 0x02
+REG_X_MSB    = 0x03
+MODE_CONTINUOUS = 0x00
+# MPU6050
+MPU_ADDR = 0x68
+MPU_PWR_MGMT_1 = 0x6B
+MPU_ACCEL_XOUT_H = 0x3B
+
+# Kalibrasi magnetometer (silakan sesuaikan)
+OFFSET_X = 0.0
+OFFSET_Y = 0.0
+OFFSET_Z = 0.0
+SCALE_X  = 1.0
+SCALE_Y  = 1.0
+SCALE_Z  = 1.0
+
+# Parameter heading
+DECLINATION_DEG   = 0.0
+HEADING_ALPHA     = 0.25
+HEADING_BIAS_DEG  = 0.0
+AUTO_SET_BIAS_ON_START = True
+
+# Ambang arah benar/keluar
+ALIGN_OK_DEG      = 25.0
+ALIGN_EXIT_DEG    = 35.0
+ALIGN_STABLE_SEC  = 1.0
+
+INVERT_TURN       = False
+
+class MPU6050:
+    def _init_(self, bus_id=1, addr=MPU_ADDR):
+        self.bus = smbus2.SMBus(bus_id)
+        self.addr = addr
+        self.bus.write_byte_data(self.addr, MPU_PWR_MGMT_1, 0x00)
+        time.sleep(0.05)
+
+    def _read_i16(self, reg_hi):
+        hi = self.bus.read_byte_data(self.addr, reg_hi)
+        lo = self.bus.read_byte_data(self.addr, reg_hi + 1)
+        val = (hi << 8) | lo
+        if val > 32767: val -= 65536
+        return val
+
+    def read_accel_g(self):
+        ax = self._read_i16(MPU_ACCEL_XOUT_H) / 16384.0
+        ay = self._read_i16(MPU_ACCEL_XOUT_H + 2) / 16384.0
+        az = self._read_i16(MPU_ACCEL_XOUT_H + 4) / 16384.0
+        return ax, ay, az
+
+    def read_pitch_roll_rad(self):
+        ax, ay, az = self.read_accel_g()
+        roll  = math.atan2(ay, az)
+        pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az))
+        return pitch, roll
+
+class TiltCompass:
+    def _init_(self, bus_id=1, addr=HMC_ADDR):
+        self.bus = smbus2.SMBus(bus_id)
+        self.addr = addr
+        self._smooth = None
+        self.bus.write_byte_data(self.addr, REG_CONFIG_A, 0x70)  # 8avg,15Hz
+        self.bus.write_byte_data(self.addr, REG_CONFIG_B, 0xA0)  # Gain
+        self.bus.write_byte_data(self.addr, REG_MODE, MODE_CONTINUOUS)
+        time.sleep(0.06)
+        self.imu = MPU6050(bus_id=bus_id)
+
+    def _read_raw_axis(self, start_addr):
+        hi = self.bus.read_byte_data(self.addr, start_addr)
+        lo = self.bus.read_byte_data(self.addr, start_addr + 1)
+        val = (hi << 8) | lo
+        if val > 32767: val -= 65536
+        return val
+
+    def read_mag_xyz(self):
+        x = self._read_raw_axis(REG_X_MSB)
+        z = self._read_raw_axis(REG_X_MSB + 2)
+        y = self._read_raw_axis(REG_X_MSB + 4)
+        x = (x - OFFSET_X) * SCALE_X
+        y = (y - OFFSET_Y) * SCALE_Y
+        z = (z - OFFSET_Z) * SCALE_Z
+        return x, y, z
+
+    def read_heading_deg(self):
+        pitch, roll = self.imu.read_pitch_roll_rad()
+        mx, my, mz = self.read_mag_xyz()
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cr, sr = math.cos(roll),  math.sin(roll)
+        Xh = mx*cp + mz*sp
+        Yh = mx*sr*sp + my*cr - mz*sr*cp
+        hdg = math.degrees(math.atan2(Yh, Xh))
+        if hdg < 0: hdg += 360.0
+        hdg = (hdg + DECLINATION_DEG) % 360.0
+        if self._smooth is None:
+            self._smooth = hdg
+        else:
+            diff = (hdg - self._smooth + 540) % 360 - 180
+            self._smooth = (self._smooth + HEADING_ALPHA * diff) % 360.0
+        return (self._smooth + HEADING_BIAS_DEG) % 360.0
+
+def bearing_deg(lat1, lon1, lat2, lon2):
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlmb = math.radians(lon2 - lon1)
+    y = math.sin(dlmb) * math.cos(phi2)
+    x = math.cos(phi1)*math.sin(phi2) - math.sin(phi1)*math.cos(phi2)*math.cos(dlmb)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+def rel_bearing_text(rel_brg):
+    if rel_brg <= 15 or rel_brg >= 345: return "Lurus"
+    if 15 < rel_brg <= 45:              return "Sedikit ke kanan"
+    if 45 < rel_brg <= 135:             return "Belok kanan"
+    if 135 < rel_brg <= 225:            return "Putar balik"
+    if 225 < rel_brg <= 315:            return "Belok kiri"
+    if 315 < rel_brg < 345:             return "Sedikit ke kiri"
+    return "Lurus"
+
+tilt_compass = None
+
+# ========================== CONFIG COMMON ==========================
+API_KEY = "REMOVED"
 HF_BASE = "https://router.huggingface.co/v1"
 CHAT_MODEL = "openai/gpt-oss-20b:fireworks-ai"
-MIN_CONFIDENCE = 0.3
-SPEAK_INTERVAL = 5.0  # YOLO announce interval
-
 client_yolo = OpenAI(base_url=HF_BASE, api_key=API_KEY)
+
+SPEAK_INTERVAL = 5.0
+OSRM_TIMEOUT = 6
+REROUTE_GPS_TIMEOUT = 6
 
 # ====== GPS via GPIO UART ======
 GPS_PORT = "/dev/serial0"
 GPS_BAUD = 9600
-GPS_POWER_PIN = 17   # optional EN pin
-GPS_PPS_PIN   = 18   # optional PPS 1 Hz
+GPS_POWER_PIN = 17
+GPS_PPS_PIN   = 18
 
 # ====== Ultrasonic pins (BCM) ======
 TRIG_PIN = 23
 ECHO_PIN = 24
 
-# ====== Shared ======
+# ====== FLAGS / LOCKS ======
 stop_event = threading.Event()
+ops_stop_event = threading.Event()
+ops_running = threading.Event()
 
-# Navigation state (updated by voice)
 nav_update_event = threading.Event()
 dest_lock = threading.Lock()
 current_destination_name = None
@@ -60,8 +187,9 @@ gps_ready = threading.Event()
 voice_ready = threading.Event()
 ultrasonic_ready = threading.Event()
 
-# ========== AUDIO (priority + preempt) ==========
-audio_queue = queue.PriorityQueue()
+# ========================== AUDIO (priority + preempt) ==========================
+import queue as _queue
+audio_queue = _queue.PriorityQueue()
 preempt_event = threading.Event()
 yolo_active = threading.Event()
 
@@ -96,7 +224,8 @@ def audio_player_worker():
             if filepath is None:
                 break
             if os.path.exists(filepath):
-                proc = subprocess.Popen(["mpg123", filepath])
+                proc = subprocess.Popen(["mpg123", "-q", filepath])
+                _set_current_proc(proc)
                 while proc.poll() is None:
                     if pr > 0 and preempt_event.is_set():
                         try: proc.terminate()
@@ -106,7 +235,8 @@ def audio_player_worker():
                 try:
                     if proc.poll() is None:
                         proc.terminate()
-                except: pass
+                except Exception:
+                    pass
                 if pr == 0:
                     yolo_active.clear()
                     preempt_event.clear()
@@ -116,7 +246,7 @@ def audio_player_worker():
 
 threading.Thread(target=audio_player_worker, daemon=True).start()
 
-# ========== GPIO INIT ==========
+# ========================== GPIO INIT ==========================
 def gpio_setup_common():
     GPIO.setwarnings(False)
     GPIO.setmode(GPIO.BCM)
@@ -151,12 +281,8 @@ def wait_pps(timeout=5):
         pass
     return False
 
-# ========== GPS & Geocoding ==========
+# ========================== GPS & Geocoding ==========================
 def get_gps_coordinates(timeout_total=30, debug=False):
-    """
-    Baca koordinat dari GPS_PORT (GPIO UART). Dukung $GPGGA/$GPRMC/$GNGGA/$GNRMC.
-    Kembalikan (lat, lon) atau None jika timeout.
-    """
     try:
         GPIO.output(GPS_POWER_PIN, GPIO.HIGH)
     except Exception:
@@ -174,7 +300,7 @@ def get_gps_coordinates(timeout_total=30, debug=False):
     wanted = ("$GPGGA", "$GPRMC", "$GNGGA", "$GNRMC")
     t0 = time.time()
 
-    while not stop_event.is_set():
+    while not stop_event.is_set() and not ops_stop_event.is_set():
         if time.time() - t0 > timeout_total:
             if debug: print("[GPS] Timeout total tanpa fix.")
             return None
@@ -206,6 +332,20 @@ def get_gps_coordinates(timeout_total=30, debug=False):
                 continue
         time.sleep(0.05)
 
+def gps_warmup_worker():
+    print("🛰️  GPS warm-up worker aktif.")
+    while not stop_event.is_set():
+        if gps_ready.is_set():
+            time.sleep(5); continue
+        loc = get_gps_coordinates(timeout_total=15, debug=False)
+        if loc is not None:
+            if not gps_ready.is_set():
+                tts_and_enqueue("GPS siap.", priority=0)
+            gps_ready.set()
+            time.sleep(10)
+        else:
+            time.sleep(3)
+
 def get_coordinates_from_name(place_name):
     url = "https://nominatim.openstreetmap.org/search"
     params = {"q": place_name, "format": "json", "limit": 1}
@@ -233,32 +373,25 @@ def reverse_geocode(lat, lon):
         print(f"[REVERSE GEOCODE ERROR] {e}")
         return f"{lat:.5f}, {lon:.5f}"
 
-# ========== OSRM (walking, fallback driving) ==========
-def osrm_route(orig, dest, profile="walking"):
+# ========================== OSRM ==========================
+def osrm_route(orig, dest, profile="walking", timeout=OSRM_TIMEOUT):
     base = "http://router.project-osrm.org/route/v1"
     url = f"{base}/{profile}/{orig[1]},{orig[0]};{dest[1]},{dest[0]}?overview=full&geometries=geojson&steps=true"
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=timeout)
         data = r.json()
-        if "routes" in data and data["routes"]:
+        if isinstance(data, dict) and data.get("routes"):
             return data["routes"][0]
     except Exception as e:
         print(f"[OSRM {profile} ERROR] {e}")
     return None
 
 def get_route_structured(orig, dest):
-    """
-    Return (poly_latlon, maneuvers)
-    poly_latlon: list[(lat,lon)]
-    maneuvers: list[{'action','modifier','text','loc','distance'}]
-    """
     data = osrm_route(orig, dest, profile="walking") or osrm_route(orig, dest, profile="driving")
     if not data:
         return [], []
-
     coords = data["geometry"]["coordinates"]  # [lon,lat]
     poly_latlon = [(lat, lon) for lon, lat in coords]
-
     mans = []
     for leg in data.get("legs", []):
         for step in leg.get("steps", []):
@@ -274,28 +407,16 @@ def get_route_structured(orig, dest):
             })
     return poly_latlon, mans
 
-# ========== Geometry helpers ==========
+# ========================== Geometry helpers ==========================
 def meters(p1, p2):
     return geodesic(p1, p2).meters
 
-def bearing_deg(p1, p2):
-    # rhumb-ish simple initial bearing
-    lat1, lon1 = math.radians(p1[0]), math.radians(p1[1])
-    lat2, lon2 = math.radians(p2[0]), math.radians(p2[1])
-    dlon = lon2 - lon1
-    x = math.sin(dlon) * math.cos(lat2)
-    y = math.cos(lat1)*math.sin(lat2) - math.sin(lat1)*math.cos(lat2)*math.cos(dlon)
-    brng = (math.degrees(math.atan2(x, y)) + 360) % 360
-    return brng
-
 def _proj_xy(lat, lon, lat0):
-    # equirectangular projection relative to lat0
     x = (lon) * math.cos(math.radians(lat0)) * 111320.0
     y = (lat) * 110540.0
     return x, y
 
 def point_segment_distance_m(P, A, B):
-    # approximate in meters using local equirectangular
     lat0 = (A[0]+B[0]+P[0])/3.0
     Px, Py = _proj_xy(P[0], P[1], lat0)
     Ax, Ay = _proj_xy(A[0], A[1], lat0)
@@ -319,7 +440,7 @@ def distance_to_polyline_m(P, poly):
         if d < mind: mind = d
     return mind
 
-# ========== Instruction formatting ==========
+# ========================== Instruction formatting ==========================
 def instr_text(action, modifier):
     action = (action or "").lower()
     modifier = (modifier or "").lower()
@@ -340,7 +461,6 @@ def instr_text(action, modifier):
         }
         if modifier in dir_map:
             return dir_map[modifier].capitalize()
-        # default
         if action == "continue":
             return "Lurus"
         if action == "fork":
@@ -353,7 +473,6 @@ def instr_text(action, modifier):
     return (action or "Ikuti jalan").capitalize()
 
 def speak_ahead(dist_m, base):
-    # “Dalam 200 meter, belok kiri.”
     tts_and_enqueue(f"Dalam {int(dist_m)} meter, {base.lower()}.", priority=1)
 
 def speak_now(base):
@@ -363,7 +482,7 @@ def speak_continue(dist_m):
     if dist_m > 20:
         tts_and_enqueue(f"Lanjut lurus {int(dist_m)} meter.", priority=1)
 
-# ====== Map save ======
+# ========================== Map save ==========================
 def save_map(route_coords, orig, dest):
     try:
         m = folium.Map(location=orig, zoom_start=16)
@@ -375,9 +494,8 @@ def save_map(route_coords, orig, dest):
     except Exception as e:
         print(f"[MAP ERROR] {e}")
 
-# ====== NAV: destination & main loop ======
+# ========================== NAV: destination & main loop ==========================
 def update_destination(dest_name):
-    """Ubah tujuan via nama tempat; trigger nav worker."""
     global current_destination_name, current_destination_coords
     coords = get_coordinates_from_name(dest_name)
     if not coords:
@@ -387,151 +505,236 @@ def update_destination(dest_name):
         current_destination_name = dest_name
         current_destination_coords = coords
         nav_update_event.set()
-    tts_and_enqueue(f"Siap. Navigasi ke {dest_name} dimulai.", priority=0)
+    tts_and_enqueue(f"Siap. Navigasi ke {dest_name} disiapkan.", priority=0)
     return True
 
-def navigate_like_gmaps(poly, mans, cancel_event=None):
-    """
-    Turn-by-turn with early/near/now prompts, continue prompts, reroute if off-route,
-    until arrive or cancel_event set.
-    """
+def navigate_with_turn_triggers(poly, mans, cancel_event=None):
     if not mans:
-        tts_and_enqueue("Rute tidak tersedia.", priority=1); return
+        tts_and_enqueue("Rute tidak tersedia.", priority=1)
+        return
 
-    # thresholds (walking)
-    FAR = 180.0     # meter, notifikasi jauh
-    NEAR = 60.0     # meter, notifikasi dekat
-    NOW = 15.0      # meter, saat belok
-    OFFROUTE = 35.0 # meter, anggap keluar rute
-    CONTINUE_GAP = 120.0  # meter, interval “lanjut lurus …”
+    FAR = 180.0
+    NEAR_TRIGGER = 60.0
+    NOW_TRIGGER  = 7.0
+    CONTINUE_GAP = 120.0
+
+    MIN_TURN_AHEAD_M = 15.0
+    OFFROUTE_BASE = 60.0
+    OFFROUTE_STREAK_NEED = 6
+    START_GRACE_SEC = 20.0
     RECLAC_MIN_SECS = 10.0
 
     idx = 0
-    spoken_far = set()
-    spoken_near = set()
-    spoken_now = set()
     last_continue_say = 0.0
     last_recalc = 0.0
 
-    # save initial map
-    try:
-        # poly already lat,lon
-        pass
-    except: pass
+    start_ts = time.time()
+    recent_pts = deque(maxlen=6)
+    offroute_streak = 0
 
-    # arrival target:
+    spoken_far = set()
+    spoken_now = set()
+
     final_loc = mans[-1]["loc"]
 
-    while not stop_event.is_set():
-        if cancel_event is not None and cancel_event.is_set():
-            return
+    align_state_aligned = False
+    align_enter_time = None
+    last_heading_tts = 0.0
+    HEADING_TTS_COOLDOWN = 3.0
+    awaiting_post_turn_align = False
 
+    def _avg_point(pts):
+        lat = sum(p[0] for p in pts) / len(pts)
+        lon = sum(p[1] for p in pts) / len(pts)
+        return (lat, lon)
+
+    def _jitter_radius_m(pts):
+        if len(pts) < 3:
+            return 0.0
+        c = _avg_point(pts)
+        d = [meters(p, c) for p in pts]
+        return sum(d) / len(d)
+
+    while not stop_event.is_set() and not (cancel_event and cancel_event.is_set()):
         cur = get_gps_coordinates(timeout_total=5, debug=False)
         if cur is None:
-            # no fix yet
-            time.sleep(0.5); continue
+            time.sleep(0.5)
+            continue
 
-        # arrival if near final
-        if meters(cur, final_loc) <= NOW:
+        recent_pts.append(cur)
+        cur_smooth = _avg_point(recent_pts) if len(recent_pts) >= 3 else cur
+
+        if meters(cur_smooth, final_loc) <= NOW_TRIGGER:
             tts_and_enqueue("Tiba di tujuan.", priority=1)
             return
 
-        # choose current target maneuver (skip arrived/depart that are behind)
-        if idx >= len(mans): idx = len(mans)-1
+        if idx >= len(mans):
+            idx = len(mans) - 1
+
         target = mans[idx]
-        dcur = meters(cur, target["loc"])
-
-        # ---- reroute detection ----
-        dpoly = distance_to_polyline_m(cur, poly)
-        if dpoly > OFFROUTE and (time.time() - last_recalc) > RECLAC_MIN_SECS:
-            tts_and_enqueue("Rute diubah, menghitung ulang.", priority=1)
-            last_recalc = time.time()
-            return "REROUTE"  # signal to worker to recompute
-
         base = instr_text(target["action"], target["modifier"])
+        dcur = meters(cur_smooth, target["loc"])
 
-        # ---- staged prompts ----
-        if dcur > FAR and idx not in spoken_far:
-            speak_ahead(min(300, round(dcur/10)*10), base)  # cap 300 m for walking
+        jitter = _jitter_radius_m(recent_pts)
+        OFFROUTE = OFFROUTE_BASE + max(15.0, 3.0 * jitter)
+        dpoly = distance_to_polyline_m(cur_smooth, poly)
+
+        try:
+            if tilt_compass is not None:
+                head = tilt_compass.read_heading_deg()
+                brg  = bearing_deg(cur_smooth[0], cur_smooth[1], target["loc"][0], target["loc"][1])
+                rel_nominal = (brg - head + 360.0) % 360.0
+                rel = rel_nominal if not INVERT_TURN else (head - brg + 360.0) % 360.0
+                now_ts = time.time()
+                base_is_straight = base.lower().startswith("lurus")
+
+                if rel <= ALIGN_OK_DEG or rel >= (360.0 - ALIGN_OK_DEG):
+                    if not align_state_aligned:
+                        if align_enter_time is None:
+                            align_enter_time = now_ts
+                        elif (now_ts - align_enter_time) >= ALIGN_STABLE_SEC:
+                            align_state_aligned = True
+                            align_enter_time = None
+                            if awaiting_post_turn_align:
+                                tts_and_enqueue("Lurus di jalur.", priority=1)
+                                awaiting_post_turn_align = False
+                            else:
+                                tts_and_enqueue("Arah benar, lanjut lurus.", priority=1)
+                            last_heading_tts = now_ts
+                else:
+                    if align_state_aligned and (rel > ALIGN_EXIT_DEG and rel < (360.0 - ALIGN_EXIT_DEG)):
+                        align_state_aligned = False
+                        align_enter_time = None
+                    if (not base_is_straight) and (now_ts - last_heading_tts >= HEADING_TTS_COOLDOWN):
+                        txt = rel_bearing_text(rel)
+                        if txt != "Lurus":
+                            tts_and_enqueue(txt + ".", priority=1)
+                            last_heading_tts = now_ts
+        except Exception:
+            pass
+
+        bl = base.lower()
+        is_turn = (target["action"] in ("turn", "roundabout", "fork", "end of road", "merge")
+                   or "belok" in bl or "putar" in bl or "bundaran" in bl)
+
+        if dcur <= max(NEAR_TRIGGER, MIN_TURN_AHEAD_M) and idx not in spoken_far:
+            ahead_dist = max(MIN_TURN_AHEAD_M, int(round(dcur)))
+            if is_turn:
+                speak_ahead(ahead_dist, base)
+            else:
+                speak_ahead(max(5, int(round(dcur / 5) * 5)), base)
             spoken_far.add(idx)
 
-        if NEAR < dcur <= FAR and idx not in spoken_near:
-            speak_ahead(int(max(NEAR, round(dcur/10)*10)), base)
-            spoken_near.add(idx)
-
-        if dcur <= NOW and idx not in spoken_now:
+        if dcur <= NOW_TRIGGER and idx not in spoken_now:
             speak_now(base)
             spoken_now.add(idx)
+            if is_turn:
+                awaiting_post_turn_align = True
 
-        # ---- step advancement ----
-        # Advance when closer to next maneuver than current (or already passed)
+        if (time.time() - start_ts) > START_GRACE_SEC:
+            if dpoly > OFFROUTE:
+                offroute_streak += 1
+            else:
+                offroute_streak = 0
+            if (offroute_streak >= OFFROUTE_STREAK_NEED and
+                (time.time() - last_recalc) > RECLAC_MIN_SECS):
+                tts_and_enqueue("Rute diubah, menghitung ulang.", priority=1)
+                last_recalc = time.time()
+                return "REROUTE"
+
         if idx + 1 < len(mans):
-            dnext = meters(cur, mans[idx+1]["loc"])
-            if (dnext + 5) < dcur or (dcur <= NOW/2):
+            dnext = meters(cur_smooth, mans[idx+1]["loc"])
+            if (dnext + 5) < dcur or dcur <= NOW_TRIGGER/2:
                 idx += 1
-                # after-turn confirmation: tell how long to next
                 if idx < len(mans):
                     seg_len = int(max(20, mans[idx]["distance"]))
                     if seg_len > 40:
-                        nowt = time.time()
-                        if nowt - last_continue_say > 5:
-                            speak_continue(min(seg_len, 400))
-                            last_continue_say = nowt
-                continue
-        else:
-            # last step: keep approaching arrival (handled above)
-            pass
-
-        # ---- periodic reassurance 'continue' on long stretches ----
-        if idx < len(mans):
-            seg_len = mans[idx]["distance"]
-            nowt = time.time()
-            if seg_len >= CONTINUE_GAP and (nowt - last_continue_say) > 40:
-                speak_continue(min(int(seg_len), 500))
-                last_continue_say = nowt
+                        speak_continue(min(seg_len, 400))
+                        time.sleep(0.2)
 
         time.sleep(0.5)
 
-def gps_nav_worker():
-    """Listen for destination changes, compute route, and run nav loop. Reroute on demand."""
-    print("📡 GPS Navigation worker aktif. Ucapkan 'menuju ...' untuk set tujuan.")
-    while not stop_event.is_set():
+def gps_nav_worker(cancel_event=None):
+    print("📡 GPS Navigation worker aktif (standby). Ucapkan 'menuju ...' lalu 'mulai' untuk menyalakan navigasi.")
+    last_poly = None
+    last_mans = None
+    auto_bias_done = False
+
+    while not stop_event.is_set() and not (cancel_event and cancel_event.is_set()):
         nav_update_event.wait(timeout=0.5)
-        if stop_event.is_set(): break
-        if not nav_update_event.is_set(): continue
+        if stop_event.is_set() or (cancel_event and cancel_event.is_set()):
+            break
+        if not nav_update_event.is_set():
+            continue
 
         with dest_lock:
             dest_name = current_destination_name
             dest_coords = current_destination_coords
             nav_update_event.clear()
 
-        # main nav cycle with reroute handling
-        while not stop_event.is_set():
+        while not stop_event.is_set() and not (cancel_event and cancel_event.is_set()):
             cur = get_gps_coordinates(timeout_total=30, debug=False)
             if cur is None:
                 tts_and_enqueue("GPS belum siap, mencari sinyal satelit.", priority=1)
-                time.sleep(2); continue
+                time.sleep(2)
+                continue
 
-            # compute route
             poly, mans = get_route_structured(cur, dest_coords)
             if not mans:
                 tts_and_enqueue("Gagal menghitung rute.", priority=1)
                 break
 
-            # save map
+            last_poly, last_mans = poly, mans
+            try: save_map(poly, cur, dest_coords)
+            except Exception: pass
+
             try:
-                save_map(poly, cur, dest_coords)
-            except: pass
+                if AUTO_SET_BIAS_ON_START and (not auto_bias_done) and tilt_compass is not None and mans:
+                    head0 = tilt_compass.read_heading_deg()
+                    brg0  = bearing_deg(cur[0], cur[1], mans[0]["loc"][0], mans[0]["loc"][1])
+                    global HEADING_BIAS_DEG
+                    HEADING_BIAS_DEG = (brg0 - head0 + 360.0) % 360.0
+                    if HEADING_BIAS_DEG > 180.0: HEADING_BIAS_DEG -= 360.0
+                    auto_bias_done = True
+                    tts_and_enqueue("Kompas dikalibrasi terhadap arah rute.", priority=1)
+            except Exception:
+                pass
 
-            # run nav loop
-            res = navigate_like_gmaps(poly, mans, cancel_event=nav_update_event)
-            if res == "REROUTE":
-                # loop again to recalc
-                continue
+            res = navigate_with_turn_triggers(poly, mans, cancel_event=cancel_event)
+            if res != "REROUTE":
+                break
+
+            cur2 = get_gps_coordinates(timeout_total=REROUTE_GPS_TIMEOUT, debug=False) or cur
+            new_route = osrm_route(cur2, dest_coords, profile="walking", timeout=OSRM_TIMEOUT) \
+                        or osrm_route(cur2, dest_coords, profile="driving", timeout=OSRM_TIMEOUT)
+            if new_route and "geometry" in new_route:
+                coords = new_route["geometry"]["coordinates"]
+                poly = [(lat, lon) for lon, lat in coords]
+                mans = []
+                for leg in new_route.get("legs", []):
+                    for step in leg.get("steps", []):
+                        man = step.get("maneuver", {})
+                        action = man.get("type", "") or ""
+                        modifier = man.get("modifier", "") or ""
+                        loc = (man["location"][1], man["location"][0])
+                        dist = float(step.get("distance", 0.0))
+                        text = step.get("name", "")
+                        mans.append({
+                            "action": action, "modifier": modifier, "text": text,
+                            "loc": loc, "distance": dist
+                        })
+                last_poly, last_mans = poly, mans
+                try: save_map(poly, cur2, dest_coords)
+                except Exception: pass
             else:
-                break  # arrived or cancelled
+                tts_and_enqueue("Jaringan lambat, menggunakan rute sebelumnya.", priority=1)
+                if last_poly and last_mans:
+                    poly, mans = last_poly, last_mans
+                else:
+                    break
+            continue
 
-# ========== YOLO + Ultrasonic + AI ==========
+# ========================== Ultrasonic ==========================
 def get_distance():
     try:
         GPIO.output(TRIG_PIN, False)
@@ -560,6 +763,7 @@ def get_distance():
         print(f"[ULTRASONIC ERROR] {e}")
         return None
 
+# ========================== Chat / AI Prompt ==========================
 messages_lock = threading.Lock()
 messages = [
     {"role": "system",
@@ -585,66 +789,175 @@ def ask_ai(user_text):
         print(f"[AI ERROR] {e}")
         return "Maaf, terjadi kesalahan."
 
-def yolo_detection():
+# ========================== YOLO FAST (Ultralytics) ==========================
+from ultralytics import YOLO
+from threading import Thread, Lock
+
+MODEL_PATH   = "models/my_model.pt"   # <<< sesuai permintaan kamu
+IMG_SIZE     = 320
+CONF_THRES   = 0.50
+MAX_DET      = 20
+FRAME_SKIP   = 2
+DEVICE       = "cpu"
+CPU_THREADS  = 2
+
+# ===== Kamera (V4L2 /dev/video0 – TANPA libcamera) =====
+CAM_SRC      = 0
+CAM_WIDTH    = 640
+CAM_HEIGHT   = 480
+CAM_FPS_HINT = 30
+USE_MJPG     = True
+SHOW_WINDOW  = True
+MIN_CONFIDENCE = CONF_THRES
+
+def set_cpu_threads(n: int):
+    n = max(1, int(n))
+    os.environ["OMP_NUM_THREADS"] = str(n)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(n)
+    os.environ["MKL_NUM_THREADS"] = str(n)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(n)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(n)
     try:
-        print("[YOLO] Memuat model YOLOv5n...")
-        model = torch.hub.load('ultralytics/yolov5', 'yolov5n', pretrained=True)
-        model.eval(); yolo_ready.set()
-    except Exception as e:
-        print(f"[YOLO LOAD ERROR] {e}"); return
+        torch.set_num_threads(n)
+    except Exception:
+        pass
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[YOLO STREAM ERROR] Kamera USB tidak bisa dibuka.")
-        return
-    yolo_ready.set()
+class CamReader:
+    """Threaded camera reader (V4L2 /dev/video0, tanpa libcamera)."""
+    def _init_(self, src=0, width=640, height=480, fps=30, use_mjpg=True):
+        self.cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
+        if use_mjpg:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+        self.cap.set(cv2.CAP_PROP_FPS, int(fps))
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
 
-    last_announced = 0
-    cv2.namedWindow("YOLO Detection", cv2.WINDOW_NORMAL)
+        if not self.cap.isOpened():
+            raise RuntimeError("Kamera tidak bisa dibuka! Pastikan /dev/video0 ada (aktifkan bcm2835-v4l2).")
 
+        self.ok = True
+        self.frame = None
+        self.lock = Lock()
+        self.t = Thread(target=self._loop, daemon=True)
+        self.t.start()
+
+    def _loop(self):
+        while self.ok:
+            ok, f = self.cap.read()
+            if not ok:
+                time.sleep(0.002); continue
+            with self.lock:
+                self.frame = f
+
+    def read(self):
+        with self.lock:
+            f = None if self.frame is None else self.frame.copy()
+        return (False, None) if f is None else (True, f)
+
+    def release(self):
+        self.ok = False
+        try: self.t.join(timeout=0.5)
+        except Exception: pass
+        self.cap.release()
+
+def draw_boxes(frame, results, names, thickness=2):
+    for r in results:
+        boxes = getattr(r, "boxes", None)
+        if boxes is None: continue
+        try:
+            b = boxes.xyxy.cpu().numpy().astype(int)
+            c = boxes.cls.cpu().numpy().astype(int)
+            conf = boxes.conf.cpu().numpy()
+        except Exception:
+            b = np.array(boxes.xyxy, dtype=int)
+            c = np.array(boxes.cls, dtype=int)
+            conf = np.array(boxes.conf, dtype=float)
+        for (x1, y1, x2, y2), ci, cf in zip(b, c, conf):
+            if cf < CONF_THRES: continue
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), thickness)
+            label_name = names.get(ci, str(ci)) if isinstance(names, dict) else str(ci)
+            label = f"{label_name} {cf:.2f}"
+            y_text = y1 - 8 if y1 > 18 else y1 + 18
+            cv2.putText(frame, label, (x1, y_text),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 2, cv2.LINE_AA)
+    return frame
+
+def yolo_detection(cancel_event=None):
     try:
-        while not stop_event.is_set():
-            ret, frame = cap.read()
-            if not ret: time.sleep(0.01); continue
+        set_cpu_threads(CPU_THREADS)
 
-            input_frame = cv2.resize(frame, (640, 480))
-            with torch.no_grad():
-                results = model(input_frame)
+        print("[YOLO] Memuat model:", MODEL_PATH)
+        model = YOLO(MODEL_PATH)
 
-            try:
-                rendered = results.render()[0]
-                cv2.imshow("YOLO Detection", rendered)
-            except Exception:
-                cv2.imshow("YOLO Detection", input_frame)
+        names = {}
+        if hasattr(model, "names") and isinstance(model.names, (list, dict)):
+            names = model.names
+        elif hasattr(model, "model") and hasattr(model.model, "names"):
+            names = model.model.names
 
-            preds = results.pred[0]
-            if preds is None or len(preds) == 0:
-                if cv2.waitKey(1) & 0xFF == ord('q'): stop_event.set(); break
-                continue
+        dummy = np.zeros((CAM_HEIGHT, CAM_WIDTH, 3), dtype=np.uint8)
+        _ = model.predict(dummy, imgsz=IMG_SIZE, conf=CONF_THRES,
+                          max_det=MAX_DET, device=DEVICE, verbose=False)
 
-            counts = {}
-            positions = {}
-            frame_w = input_frame.shape[1]
+        cam = CamReader(src=CAM_SRC, width=CAM_WIDTH, height=CAM_HEIGHT,
+                        fps=CAM_FPS_HINT, use_mjpg=USE_MJPG)
+        yolo_ready.set()
 
-            for p in preds:
-                conf = float(p[4]); cls_idx = int(p[5])
-                if conf < MIN_CONFIDENCE: continue
-                name = results.names.get(cls_idx, str(cls_idx))
-                x1, y1, x2, y2 = p[:4]
-                x_center = (x1 + x2) / 2
-                if x_center < frame_w/3: pos = "kiri"
-                elif x_center > (2*frame_w/3): pos = "kanan"
-                else: pos = "tengah"
-                counts[name] = counts.get(name, 0) + 1
-                positions[name] = pos
+        last_results = None
+        frame_id = 0
+        fps_hist = deque(maxlen=20)
+        last_announced = 0.0
 
-            if counts:
-                now = time.time()
-                if now - last_announced >= SPEAK_INTERVAL:
+        if SHOW_WINDOW:
+            try: cv2.namedWindow("YOLO Detection", cv2.WINDOW_NORMAL)
+            except Exception: pass
+
+        while not stop_event.is_set() and not (cancel_event and cancel_event.is_set()):
+            ok, frame = cam.read()
+            if not ok or frame is None:
+                time.sleep(0.005); continue
+
+            if frame_id % max(1, FRAME_SKIP) == 0:
+                t0 = time.time()
+                results = model.predict(
+                    frame, imgsz=IMG_SIZE, conf=CONF_THRES,
+                    max_det=MAX_DET, device=DEVICE, verbose=False
+                )
+                last_results = results
+                fps = 1.0 / max(1e-6, (time.time() - t0))
+                fps_hist.append(fps)
+
+                counts = {}
+                positions = {}
+                h, w = frame.shape[:2]
+                for r in results:
+                    boxes = getattr(r, "boxes", None)
+                    if boxes is None: continue
+                    try:
+                        xyxy = boxes.xyxy.cpu().numpy()
+                        cls  = boxes.cls.cpu().numpy().astype(int)
+                        conf = boxes.conf.cpu().numpy()
+                    except Exception:
+                        xyxy = np.array(boxes.xyxy)
+                        cls  = np.array(boxes.cls, dtype=int)
+                        conf = np.array(boxes.conf, dtype=float)
+                    for (x1, y1, x2, y2), ci, cf in zip(xyxy, cls, conf):
+                        if cf < MIN_CONFIDENCE: continue
+                        name = names.get(ci, str(ci))
+                        xc = (x1 + x2) / 2.0
+                        pos = "kiri" if xc < w/3 else ("kanan" if xc > 2*w/3 else "tengah")
+                        counts[name] = counts.get(name, 0) + 1
+                        positions[name] = pos
+
+                if counts and (time.time() - last_announced) >= SPEAK_INTERVAL:
                     parts = []
                     for k, v in counts.items():
                         pos = positions.get(k, "")
-                        obj = f"{v} {k}" if v>1 else k
+                        obj = f"{v} {k}" if v > 1 else k
                         if pos: obj += f" di {pos}"
                         parts.append(obj)
                     summary = ", ".join(parts)
@@ -655,33 +968,98 @@ def yolo_detection():
                     elif "tengah" in positions.values(): instr = "Hati-hati di depan."
 
                     jarak = get_distance()
-                    if jarak is not None and jarak < 100:
-                        prompt = f"Ada {summary}, jaraknya sekitar {jarak} centimeter. {instr} "\
-                                 f"Sebutkan informasi itu dengan gaya singkat alami."
-                    else:
-                        if cv2.waitKey(1) & 0xFF == ord('q'): stop_event.set(); break
-                        continue
+                    if jarak is not None and jarak < 200:
+                        prompt = (f"Ada {summary}, jaraknya sekitar {int(jarak)} centimeter. "
+                                  f"{instr} Sebutkan informasi itu dengan gaya singkat alami.")
+                        bot_reply = ask_ai(prompt)
+                        clean = bot_reply.replace("*","").replace("\n"," ").replace("_"," ").strip()
+                        print(f"[AI] {clean}")
+                        tts_and_enqueue(clean, priority=0)
+                        last_announced = time.time()
 
-                    bot_reply = ask_ai(prompt)
-                    clean = bot_reply.replace("*","").replace("\n"," ").replace("_"," ").strip()
-                    print(f"[AI] {clean}")
-                    tts_and_enqueue(clean, priority=0)
-                    last_announced = now
+            if last_results is not None:
+                frame = draw_boxes(frame, last_results, names, thickness=2)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'): stop_event.set(); break
+            if fps_hist:
+                fps_disp = sum(fps_hist) / len(fps_hist)
+                cv2.putText(frame, f"FPS~{fps_disp:.1f} (skip={FRAME_SKIP})",
+                            (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+            if SHOW_WINDOW:
+                try:
+                    cv2.imshow("YOLO Detection", frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        if cancel_event: cancel_event.set()
+                        break
+                except Exception:
+                    pass
+            else:
+                time.sleep(0.001)
+
+            frame_id += 1
+
+    except Exception as e:
+        print(f"[YOLO ERROR] {e}")
     finally:
-        cap.release(); cv2.destroyAllWindows()
+        try: cam.release()
+        except Exception: pass
+        try: cv2.destroyAllWindows()
+        except Exception: pass
 
-# ========== VOICE INTENTS ==========
+# ========================== VOICE INTENTS & CONTROL ==========================
+t_nav = None
+t_yolo = None
+
+def start_ops():
+    """Mulai operasi berat: YOLO + GPS Nav. Dipanggil saat 'mulai'."""
+    global t_nav, t_yolo
+    if ops_running.is_set():
+        tts_and_enqueue("Operasi sudah berjalan.", priority=0)
+        return
+    ops_stop_event.clear()
+    ops_running.set()
+
+    t_yolo = threading.Thread(target=yolo_detection, kwargs={"cancel_event": ops_stop_event}, daemon=True)
+    t_yolo.start()
+
+    t_nav  = threading.Thread(target=gps_nav_worker, kwargs={"cancel_event": ops_stop_event}, daemon=True)
+    t_nav.start()
+
+    tts_and_enqueue("Operasi dimulai. Deteksi objek dan navigasi aktif.", priority=0)
+
+def stop_ops():
+    """Hentikan operasi berat, tetap sisakan STT+LLM+TTS."""
+    global t_nav, t_yolo
+    if not ops_running.is_set():
+        tts_and_enqueue("Operasi sudah berhenti. Mode siaga.", priority=0)
+        return
+    ops_stop_event.set()
+    ops_running.clear()
+    try:
+        if t_yolo and t_yolo.is_alive(): t_yolo.join(timeout=1.5)
+    except Exception: pass
+    try:
+        if t_nav and t_nav.is_alive(): t_nav.join(timeout=1.5)
+    except Exception: pass
+    yolo_ready.clear()
+    ultrasonic_ready.clear()
+    tts_and_enqueue("Operasi dihentikan. Sistem kembali ke mode siaga.", priority=0)
+
 def handle_voice_command(text):
     """
+    Intent 0: kontrol → 'mulai', 'stop', 'berhenti'
     Intent 1: lokasi → 'lokasi saya di mana', 'di mana saya sekarang', 'saya ada di mana'
     Intent 2: tujuan → 'menuju ...', 'ke ...', 'arah ke ...', 'tujuan ...'
     """
     t = text.lower().strip()
 
+    if re.search(r"^(mulai|start|aktifkan)$", t):
+        start_ops(); return True
+    if re.search(r"^(stop|berhenti|nonaktifkan|pause)$", t):
+        stop_ops(); return True
+
     if re.search(r"(lokasi saya|di mana saya|saya ada di mana)", t):
-        loc = get_gps_coordinates(timeout_total=30, debug=False)
+        loc = get_gps_coordinates(timeout_total=15, debug=False)
         if loc is None:
             tts_and_enqueue("GPS belum siap, mencari sinyal satelit.", priority=0)
             return True
@@ -689,33 +1067,41 @@ def handle_voice_command(text):
         tts_and_enqueue(f"Anda berada di {place}.", priority=0)
         return True
 
-    m = re.search(r"^(menuju|ke|arah ke|tujuan)\s+(.+)$", t)
+    m = re.search(r"^(menuju|ke|arah ke|tujuan|pergi ke)\s+(.+)$", t)
     if m:
         dest_name = m.group(2).strip()
         if dest_name:
             update_destination(dest_name)
+            if not ops_running.is_set():
+                tts_and_enqueue("Tujuan disimpan. Ucapkan 'mulai' untuk memulai navigasi.", priority=0)
             return True
     return False
 
 def voice_listener_worker():
     r = sr.Recognizer()
-    mic = sr.Microphone()
+    r.dynamic_energy_threshold = False
+    r.energy_threshold = 2500
+    r.pause_threshold = 0.6
+    r.non_speaking_duration = 0.2
+
+    mic = sr.Microphone(sample_rate=16000)
     with mic as source:
-        r.adjust_for_ambient_noise(source)
-        print("[VOICE] Mendengarkan mic... bicara kapan saja.")
+        r.adjust_for_ambient_noise(source, duration=1)
+        print("[VOICE] Mendengarkan mic (mode siaga)...")
         voice_ready.set()
+        tts_and_enqueue("Sistem siap. Ucapkan 'mulai' untuk menyalakan deteksi dan navigasi, atau 'stop' untuk berhenti.", priority=0)
     while not stop_event.is_set():
         try:
             with mic as source:
                 print("[VOICE] Silakan bicara...")
-                audio = r.listen(source, timeout=5, phrase_time_limit=10)
+                audio = r.listen(source, timeout=6, phrase_time_limit=8)
             try:
                 query = r.recognize_google(audio, language="id-ID")
                 print(f"[VOICE INPUT] {query}")
-                if handle_voice_command(query): continue
-                # otherwise short assist
+                if handle_voice_command(query):
+                    continue
                 reply = ask_ai(query)
-                clean = reply.replace("*","").replace("_"," ").strip()
+                clean = reply.replace("*","").replace("_"," ").replace("\n"," ").strip()
                 tts_and_enqueue(clean, priority=0)
             except sr.UnknownValueError:
                 print("[VOICE] Tidak terdengar jelas...")
@@ -724,38 +1110,44 @@ def voice_listener_worker():
         except Exception:
             time.sleep(1)
 
-# ========== READINESS MONITOR ==========
+# ========================== READINESS MONITOR ==========================
 def readiness_monitor():
-    announced = set(); all_done = False
-    def say_once(flag, name, msg):
-        if flag.is_set() and name not in announced:
-            tts_and_enqueue(msg, priority=0); announced.add(name)
+    announced = set()
     while not stop_event.is_set():
-        say_once(yolo_ready, "yolo", "Visi komputer siap.")
-        say_once(gps_ready, "gps", "GPS siap.")
-        say_once(voice_ready, "voice", "Pengenalan suara siap.")
-        say_once(ultrasonic_ready, "ultra", "Sensor jarak siap.")
-        if (not all_done and yolo_ready.is_set() and gps_ready.is_set()
-            and voice_ready.is_set() and ultrasonic_ready.is_set()):
-            tts_and_enqueue("Semua sistem siap. Ucapkan 'lokasi saya di mana' atau 'menuju ...' untuk mulai.", priority=0)
-            all_done = True
-        time.sleep(0.2)
+        if gps_ready.is_set() and "gps" not in announced:
+            tts_and_enqueue("GPS siap.", priority=0); announced.add("gps")
+        if voice_ready.is_set() and "voice" not in announced:
+            announced.add("voice")
+        if ops_running.is_set():
+            if yolo_ready.is_set() and "yolo" not in announced:
+                tts_and_enqueue("Visi komputer siap.", priority=0); announced.add("yolo")
+            if ultrasonic_ready.is_set() and "ultra" not in announced:
+                tts_and_enqueue("Sensor jarak siap.", priority=0); announced.add("ultra")
+        time.sleep(0.5)
 
-# ========== MAIN ==========
-if __name__ == "__main__":
+# ========================== MAIN ==========================
+if _name_ == "_main_":
     try:
         gpio_setup_common()
         gpio_gps_init()
 
-        t_nav   = threading.Thread(target=gps_nav_worker, daemon=True)
-        t_yolo  = threading.Thread(target=yolo_detection, daemon=True)
+        try:
+            tilt_compass = TiltCompass(bus_id=I2C_BUS, addr=HMC_ADDR)
+            print("[COMPASS] TiltCompass aktif.")
+        except Exception as e:
+            tilt_compass = None
+            print(f"[COMPASS WARN] Kompas tidak tersedia: {e}")
+
         t_voice = threading.Thread(target=voice_listener_worker, daemon=True)
         t_ready = threading.Thread(target=readiness_monitor, daemon=True)
+        t_gpswu = threading.Thread(target=gps_warmup_worker, daemon=True)
 
-        t_nav.start(); t_yolo.start(); t_voice.start(); t_ready.start()
+        t_voice.start()
+        t_ready.start()
+        t_gpswu.start()
 
-        # OPTIONAL: tujuan awal
-        # update_destination("Alun-alun Kota Sukabumi")
+        # OPTIONAL: pre-set destination
+        # update_destination("SMA Negeri 1 Sukabumi")
 
         while not stop_event.is_set():
             time.sleep(0.5)
@@ -763,9 +1155,10 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[System] Dihentikan oleh user (KeyboardInterrupt).")
         stop_event.set()
+        ops_stop_event.set()
     finally:
         try: GPIO.cleanup()
-        except: pass
+        except Exception: pass
         try: audio_queue.join()
-        except: pass
+        except Exception: pass
         print("[System] Keluar.")
