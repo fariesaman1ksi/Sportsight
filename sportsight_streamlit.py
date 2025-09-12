@@ -308,7 +308,7 @@ for obj in dummy_objects:
 
 # Dashboard Statistik
 
-sst.subheader("📊 Data Sensor dan AI")
+st.subheader("📊 Data Sensor dan AI")
 
 if st.session_state.get("history"):
     latest = st.session_state["history"][-1]
