@@ -225,37 +225,37 @@ st.markdown("---")
 st.subheader("🗺️ Peta Rute Realtime")
 #Dummy History
 if not st.session_state["dummy_merdeka_loaded"]:
-    base_lat, base_lon = -6.9209, 106.9270  # lapdek
-    base_time = datetime.utcnow()
+    base_lat, base_lon = -6.9209, 106.9270
+base_time = datetime.utcnow()
 
-    dummy_points = [
-        (base_lat, base_lon),                         
-        (base_lat+0.0003, base_lon+0.0002),           
-        (base_lat+0.0004, base_lon-0.0001),           
-        (base_lat+0.0002, base_lon-0.0003),           
-        (base_lat, base_lon-0.0004),                  
-        (base_lat-0.0003, base_lon-0.0002),           
-        (base_lat-0.0004, base_lon+0.0001),           
-        (base_lat-0.0002, base_lon+0.0003),           
-        (base_lat, base_lon),                         
-    ]
+dummy_data = [
+    # (offset_lat, offset_lon, jarak, yaw, objek, command)
+    (0.0000, 0.0000, 3.5, 20, None, None),   # start
+    (0.0003, 0.0002, 3.5, 40, None, None),   # titik aman
+    (0.0004, -0.0001, 1.8, 90, "Tiang", "20 meter di depan belok kanan"),  # objek pertama
+    (0.0002, -0.0003, 3.5, 120, None, None),
+    (0.0000, -0.0004, 2.0, 160, "Orang", "5 meter di depan belok kanan"),  # objek kedua
+    (-0.0003, -0.0002, 3.5, 200, None, None),
+    (-0.0004, 0.0001, 3.5, 240, None, None),
+    (-0.0002, 0.0003, 3.5, 280, None, None),
+    (0.0000, 0.0000, 3.5, 320, None, None),  # kembali ke titik awal
+]
 
-    for i, (lat, lon) in enumerate(dummy_points):
-        dist = 1.2 if i in [3, 5] else 3.5  
-        yaw = (i * 35) % 360 if i in [3, 5] else (i * 20) % 360
+st.session_state["history"] = []  # reset dulu
+for i, (dlat, dlon, dist, yaw, obj, cmd) in enumerate(dummy_data):
+    ts = base_time + pd.Timedelta(seconds=i*20)
+    row = {
+        "ts": ts,
+        "distance_m": dist,
+        "yaw": yaw,
+        "gps_lat": base_lat + dlat,
+        "gps_lon": base_lon + dlon,
+        "cmd": cmd,
+        "ai": f"Objek terdeteksi: {obj}" if obj else None
+    }
+    st.session_state["history"].append(row)
 
-        st.session_state["history"].append({
-            "ts": base_time.replace(microsecond=0) + pd.Timedelta(seconds=i*20),
-            "distance_m": dist,
-            "yaw": yaw,
-            "gps_lat": lat,
-            "gps_lon": lon,
-            "cmd": None,
-            "ai": None,
-        })
-
-    st.session_state["dummy_merdeka_loaded"] = True
-    st.success("✅ Dummy history lari di Lapangan Merdeka (GPS, jarak, yaw) sudah dimasukkan.")
+st.success("✅ Dummy GPS + sensor + objek berhasil dimasukkan.")
     
 if st.session_state.get("history"):
     gps_points = [
@@ -273,7 +273,7 @@ else:
 
 # --- Deteksi Objek ---
 st.markdown("---")
-st.subheader("🖼️ Deteksi Objek (Dummy)")
+st.subheader("🖼️ Deteksi Objek")
 
 dummy_objects = [
     {
@@ -307,87 +307,27 @@ for obj in dummy_objects:
 
 
 # Dashboard Statistik
-st.subheader("📊 Statistik Sensor & AI (Realtime)")
+# --- Statistik Singkat ---
 
-def snapshot_state():
-    dist = None
-    yaw = None
-    gps = (None, None)
-    if not ultra_q.empty():
-        try: dist = float(ultra_q.queue[0])
-        except: dist = None
-    if not imu_q.empty():
-        try: yaw, pitch, roll = imu_q.queue[0]
-        except: yaw = None
-    if not gps_q.empty():
-        try: gps = gps_q.queue[0]
-        except: gps = (None, None)
-    last_cmd = st.session_state.get("last_cmd", None)
-    last_ai = st.session_state.get("last_ai", None)
-    timestamp = datetime.utcnow()
-    return {"ts": timestamp, "distance_m": dist, "yaw": yaw, "gps_lat": gps[0], "gps_lon": gps[1], "cmd": last_cmd, "ai": last_ai}
+st.subheader("📊 Statistik Sensor & AI (Singkat)")
 
-if "history" not in st.session_state:
-    st.session_state["history"] = []
+if st.session_state.get("history"):
+    latest = st.session_state["history"][-1]
 
-snap = snapshot_state()
-if snap["distance_m"] is not None or snap["yaw"] is not None or snap["gps_lat"] is not None:
-    st.session_state["history"].append(snap)
-MAX_HISTORY = 200
-if len(st.session_state["history"]) > MAX_HISTORY:
-    st.session_state["history"] = st.session_state["history"][-MAX_HISTORY:]
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("📏 Jarak depan (m)", f"{latest['distance_m']:.2f}" if latest["distance_m"] else "—")
+    with col2:
+        st.metric("🧭 Yaw (°)", f"{latest['yaw']:.0f}" if latest["yaw"] else "—")
+    with col3:
+        if latest["gps_lat"] and latest["gps_lon"]:
+            st.metric("📍 GPS", f"{latest['gps_lat']:.5f}, {latest['gps_lon']:.5f}")
+        else:
+            st.metric("📍 GPS", "—")
 
-df = pd.DataFrame(st.session_state["history"]).set_index("ts")
-
-m1, m2, m3 = st.columns(3)
-with m1:
-    latest_dist = df["distance_m"].dropna().iloc[-1] if "distance_m" in df.columns and not df["distance_m"].dropna().empty else None
-    st.metric("Jarak depan (m)", f"{latest_dist:.2f}" if latest_dist is not None else "—")
-with m2:
-    latest_yaw = df["yaw"].dropna().iloc[-1] if "yaw" in df.columns and not df["yaw"].dropna().empty else None
-    st.metric("Yaw (°)", f"{latest_yaw:.0f}" if latest_yaw is not None else "—")
-with m3:
-    latest_gps = (df["gps_lat"].dropna().iloc[-1], df["gps_lon"].dropna().iloc[-1]) if ("gps_lat" in df.columns and not df["gps_lat"].dropna().empty) else (None, None)
-    st.metric("GPS (lat,lon)", f"{latest_gps[0]:.5f}, {latest_gps[1]:.5f}" if latest_gps[0] is not None else "—")
-
-st.markdown("---")
-
-chart_col1, chart_col2 = st.columns(2)
-with chart_col1:
-    st.markdown("**📊 Jarak (m) — Time Series**")
-    if "distance_m" in df.columns and not df["distance_m"].dropna().empty:
-        st.line_chart(df["distance_m"].ffill(), use_container_width=True)
-    else:
-        st.info("Belum ada data jarak untuk ditampilkan.")
-
-with chart_col2:
-    st.markdown("**🧭 Yaw (°) — Time Series**")
-    if "yaw" in df.columns and not df["yaw"].dropna().empty:
-        st.line_chart(df["yaw"].ffill(), use_container_width=True)
-    else:
-        st.info("Belum ada data yaw untuk ditampilkan.")
-
-def safe_latest_and_delta(df, col):
-    if col not in df.columns or df[col].dropna().empty:
-        return None, None
-    s = df[col].dropna()
-    last = float(s.iloc[-1])
-    prev = float(s.iloc[-2]) if len(s) > 1 else last
-    return last, (last - prev)
-
-metric_col1, metric_col2 = st.columns(2)
-dist_last, dist_delta = safe_latest_and_delta(df, "distance_m")
-with metric_col1:
-    if dist_last is None:
-        st.metric(label="📏 Jarak Sekarang (m)", value="—", delta="—")
-    else:
-        st.metric(label="📏 Jarak Sekarang (m)", value=f"{dist_last:.2f}", delta=(f"{dist_delta:+.2f} m" if dist_delta is not None else "—"))
-
-yaw_last, yaw_delta = safe_latest_and_delta(df, "yaw")
-with metric_col2:
-    if yaw_last is None:
-        st.metric(label="🧭 Yaw Sekarang (°)", value="—", delta="—")
-    else:
-        st.metric(label="🧭 Yaw Sekarang (°)", value=f"{yaw_last:.2f}", delta=(f"{yaw_delta:+.2f}°" if yaw_delta is not None else "—"))
-
-
+    if latest["ai"]:
+        st.info(f"🤖 AI: {latest['ai']}")
+    if latest["cmd"]:
+        st.success(f"🗣️ Perintah: {latest['cmd']}")
+else:
+    st.info("Belum ada data sensor.")
