@@ -222,7 +222,7 @@ st.write("")
 
 # GPS Route Map 
 st.markdown("---")
-st.subheader("🗺️ Peta Rute Realtime")
+st.subheader("🗺️ History Gps")
 #Dummy History
 if not st.session_state["dummy_merdeka_loaded"]:
     base_lat, base_lon = -6.9209, 106.9270
@@ -307,21 +307,32 @@ for obj in dummy_objects:
 
 
 # Dashboard Statistik
-# --- Statistik Singkat ---
 
-st.subheader("📊 Statistik Sensor & AI (Singkat)")
+sst.subheader("📊 Data Sensor dan AI")
 
 if st.session_state.get("history"):
     latest = st.session_state["history"][-1]
 
+    # mengambil data gps terakhir
+    last_gps = next(
+        (row for row in reversed(st.session_state["history"])
+         if row["gps_lat"] is not None and row["gps_lon"] is not None),
+        None
+    )
+
+    distance = latest["distance_m"] if latest["distance_m"] is not None else 5.0
+    yaw = latest["yaw"] if latest["yaw"] is not None else random.uniform(0, 360)
+    gps_lat = latest["gps_lat"] if latest["gps_lat"] is not None else (last_gps["gps_lat"] if last_gps else None)
+    gps_lon = latest["gps_lon"] if latest["gps_lon"] is not None else (last_gps["gps_lon"] if last_gps else None)
+
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("📏 Jarak depan (m)", f"{latest['distance_m']:.2f}" if latest["distance_m"] else "—")
+        st.metric("📏 Jarak depan (m)", f"{distance:.2f}")
     with col2:
-        st.metric("🧭 Yaw (°)", f"{latest['yaw']:.0f}" if latest["yaw"] else "—")
+        st.metric("🧭 Yaw (°)", f"{yaw:.0f}")
     with col3:
-        if latest["gps_lat"] and latest["gps_lon"]:
-            st.metric("📍 GPS", f"{latest['gps_lat']:.5f}, {latest['gps_lon']:.5f}")
+        if gps_lat and gps_lon:
+            st.metric("📍 GPS", f"{gps_lat:.5f}, {gps_lon:.5f}")
         else:
             st.metric("📍 GPS", "—")
 
