@@ -313,17 +313,18 @@ st.subheader("📊 Data Sensor dan AI")
 if st.session_state.get("history"):
     latest = st.session_state["history"][-1]
 
-    # mengambil data gps terakhir
+    # cari gps terakhir yang valid dari history
     last_gps = next(
         (row for row in reversed(st.session_state["history"])
-         if row["gps_lat"] is not None and row["gps_lon"] is not None),
+         if row.get("gps_lat") is not None and row.get("gps_lon") is not None),
         None
     )
 
-    distance = latest["distance_m"] if latest["distance_m"] is not None else 5.0
-    yaw = latest["yaw"] if latest["yaw"] is not None else random.uniform(0, 360)
-    gps_lat = latest["gps_lat"] if latest["gps_lat"] is not None else (last_gps["gps_lat"] if last_gps else None)
-    gps_lon = latest["gps_lon"] if latest["gps_lon"] is not None else (last_gps["gps_lon"] if last_gps else None)
+    # isi dummy jika sensor tidak ada
+    distance = latest.get("distance_m") if latest.get("distance_m") is not None else 5.0
+    yaw = latest.get("yaw") if latest.get("yaw") is not None else random.uniform(0, 360)
+    gps_lat = latest.get("gps_lat") if latest.get("gps_lat") is not None else (last_gps["gps_lat"] if last_gps else None)
+    gps_lon = latest.get("gps_lon") if latest.get("gps_lon") is not None else (last_gps["gps_lon"] if last_gps else None)
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -331,14 +332,14 @@ if st.session_state.get("history"):
     with col2:
         st.metric("🧭 Yaw (°)", f"{yaw:.0f}")
     with col3:
-        if gps_lat and gps_lon:
+        if gps_lat is not None and gps_lon is not None:
             st.metric("📍 GPS", f"{gps_lat:.5f}, {gps_lon:.5f}")
         else:
             st.metric("📍 GPS", "—")
 
-    if latest["ai"]:
+    if latest.get("ai"):
         st.info(f"🤖 AI: {latest['ai']}")
-    if latest["cmd"]:
+    if latest.get("cmd"):
         st.success(f"🗣️ Perintah: {latest['cmd']}")
 else:
     st.info("Belum ada data sensor.")
