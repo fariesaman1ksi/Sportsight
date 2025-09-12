@@ -52,20 +52,14 @@ if "dummy_merdeka_loaded" not in st.session_state:
     st.session_state["dummy_merdeka_loaded"] = False
 
 
-# Sidebar Controls
-st.sidebar.markdown("<div class='brand brand-grad'>SportSight</div>", unsafe_allow_html=True)
-st.sidebar.write("**Mode**")
-SIMULATE = st.sidebar.checkbox("Simulasi hardware", value=True, help="Matikan di Raspberry Pi dengan sensor nyata")
+# Default config 
+SIMULATE = True
+OSS20B_URL = ""
+TEMPERATURE = 0.4
+TARGET_LAT = -6.2000
+TARGET_LON = 106.8166
+SAFETY_DISTANCE_M = 2.0
 
-OSS20B_URL = st.sidebar.text_input("OSS20B API URL", os.environ.get("OSS20B_API_URL", ""), help="Endpoint REST untuk model 20B Anda")
-TEMPERATURE = st.sidebar.slider("Temperature", 0.0, 1.2, 0.4, 0.1)
-
-# GPS Target
-TARGET_LAT = st.sidebar.text_input("Target Lat", "-6.2000")
-TARGET_LON = st.sidebar.text_input("Target Lon", "106.8166")
-
-# Safety distance threshold (meters)
-SAFETY_DISTANCE_M = st.sidebar.slider("Safety distance (m)", 0.5, 5.0, 2.0, 0.1)
 
 # Queues & State
 log_q = queue.Queue(200)
