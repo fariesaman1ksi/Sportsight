@@ -273,24 +273,27 @@ else:
 
 # --- Deteksi Objek ---
 st.markdown("---")
-st.subheader("🖼️ Deteksi Objek")
-
-# dummy objek
-import os
-
-IMAGE_DIR = "images_dummy"  # folder tempat image dummy
+st.subheader("🖼️ Deteksi Objek (Dummy)")
 
 dummy_objects = [
-    {"name": "Tiang", "image": os.path.join(IMAGE_DIR, "tiang.jpg"), "command": "20 meter di depan belok kanan"},
-    {"name": "Orang", "image": os.path.join(IMAGE_DIR, "orang.jpg"), "command": "5 meter di depan belok kanan"},
+    {
+        "name": "Tiang",
+        "image": "https://raw.githubusercontent.com/fariesaman1ksi/Sportsight/main/images_dummy/tiang.jpg",
+        "command": "20 meter di depan belok kanan"
+    },
+    {
+        "name": "Orang",
+        "image": "https://raw.githubusercontent.com/fariesaman1ksi/Sportsight/main/images_dummy/orang.jpg",
+        "command": "5 meter di depan belok kanan"
+    },
 ]
 
-# tampilkan semua objek yang terdeteksi
+
 for obj in dummy_objects:
     st.image(obj["image"], caption=obj["name"], width=200)
     st.info(f"Perintah AI: {obj['command']}")
 
-    # opsional: simpan ke history agar muncul di dashboard
+    # Simpan ke history agar muncul di dashboard
     st.session_state["history"].append({
         "ts": datetime.utcnow(),
         "distance_m": None,
@@ -300,6 +303,7 @@ for obj in dummy_objects:
         "cmd": obj["command"],
         "ai": f"Objek terdeteksi: {obj['name']}"
     })
+
 
 
 # Dashboard Statistik
