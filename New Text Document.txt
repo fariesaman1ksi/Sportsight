@@ -1,6 +1,0 @@
-streamlit
-pandas
-folium
-gtts
-SpeechRecognition
-requests
