@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
-# newsportsight.py — STT+LLM+TTS (selalu on), operasi berat (YOLO+Ultrasonic+GPS Nav) start/stop via suara
+# sportsight.py — STT+LLM+TTS (selalu on), operasi berat (YOLO+Ultrasonic+GPS Nav) start/stop via suara
+# Perubahan penting (versi ini):
+# - route.html SELALU dibuat (meski rute belum ada), jadi bisa dicek file-nya.
+# - Simpan last GPS fix sebagai fallback agar routing tidak mandek.
+# - OSRM retry + logging detail kenapa rute gagal.
+# - TTS jelas: "GPS belum siap", "Geocoding gagal", "Routing gagal", "Navigasi dimulai".
+# - Frameskip adaptif untuk YOLO; USB cam via V4L2+MJPG; imshow hanya jika GUI tersedia.
+# - Tidak ada Folium/Jinja2 (hindari SIGILL), peta pakai Leaflet murni.
+# - BARU: Wi-Fi auto-connect sebelum sistem jalan; gTTS hanya dipakai setelah internet up. Saat offline, gunakan espeak fallback.
 
 import os
+# --- path absolut berbasis lokasi file ini ---
+BASE_DIR = os.path.dirname(os.path.abspath(_file_))
 import uuid
 import time
 import math
@@ -9,10 +19,11 @@ import re
 import queue
 import threading
 import subprocess
+import json
+import socket
 from collections import deque
 
 import requests
-
 import serial
 import pynmea2
 from gtts import gTTS
@@ -21,47 +32,231 @@ from geopy.distance import geodesic
 
 import cv2
 import numpy as np
-import torch
 import speech_recognition as sr
 import RPi.GPIO as GPIO
+import smbus2  # I2C HMC5883L & MPU6050
+
+# ==== Prefer V4L2 untuk USB cam (hindari GStreamer) ====
+os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_LIST", "V4L2,FFMPEG")
+
+# ======= DEBUG / VERBOSE =======
+VERBOSE = True
+def log(*a):
+    if VERBOSE:
+        print(*a, flush=True)
+
+# =============== WIFI / INTERNET BOOTSTRAP ===============
+NET_CHECK_HOST = os.environ.get("NET_CHECK_HOST", "1.1.1.1")
+NET_CHECK_PORT = int(os.environ.get("NET_CHECK_PORT", "53"))
+NET_CHECK_HTTP = os.environ.get("NET_CHECK_HTTP", "http://clients3.google.com/generate_204")
+WIFI_IFACE = os.environ.get("WIFI_IFACE", "wlan0")
+ESPEAK_FALLBACK = True  # pakai espeak saat offline
+
+network_ready = threading.Event()
+
+def _run(cmd):
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+    except Exception:
+        return None
+
+def is_internet_up(timeout=2.0):
+    try:
+        with socket.create_connection((NET_CHECK_HOST, NET_CHECK_PORT), timeout=timeout):
+            return True
+    except Exception:
+        pass
+    try:
+        r = requests.get(NET_CHECK_HTTP, timeout=timeout)
+        return r.status_code in (204, 200)
+    except Exception:
+        return False
+
+def current_ssid():
+    r = _run(["bash","-lc", "nmcli -t -f ACTIVE,SSID dev wifi | awk -F: '$1==\"yes\"{print $2; exit}'"])
+    if r and r.returncode==0 and r.stdout.strip():
+        return r.stdout.strip()
+    r = _run(["bash","-lc", "iwgetid -r"])
+    if r and r.returncode==0 and r.stdout.strip():
+        return r.stdout.strip()
+    return None
+
+def nmcli_enable_wifi():
+    _run(["bash","-lc","nmcli radio wifi on"])
+    _run(["bash","-lc",f"nmcli dev set {WIFI_IFACE} managed yes"])
+    _run(["bash","-lc",f"nmcli dev connect {WIFI_IFACE}"])
+
+def nmcli_rescan():
+    _run(["bash","-lc","nmcli dev wifi rescan"])
+
+def nmcli_autoconnect_saved():
+    nmcli_enable_wifi()
+    nmcli_rescan()
+    _run(["bash","-lc",f"nmcli dev connect {WIFI_IFACE}"])
+
+def load_wifi_secrets(path="wifi_secrets.json"):
+    try:
+        with open(path,"r",encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def nmcli_connect_with_secrets(secrets: dict):
+    if not secrets:
+        return False
+    nmcli_rescan()
+    r = _run(["bash","-lc","nmcli -t -f SSID,SIGNAL dev wifi list | sort -t: -k2 -nr"])
+    if not r or r.returncode != 0:
+        return False
+    lines = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    for ln in lines:
+        ssid = ln.split(":")[0]
+        if not ssid:
+            continue
+        if ssid in secrets:
+            pwd = secrets[ssid]
+            log(f"[WIFI] Mencoba connect ke SSID tersimpan: {ssid}")
+            # Hindari backslash di f-string: siapkan variabel aman dulu
+            safe_ssid = ssid.replace("'", "'\\''")
+            safe_pwd = str(pwd).replace("'", "'\\''")
+            r2 = _run([
+                "bash","-lc",
+                f"nmcli dev wifi connect '{safe_ssid}' password '{safe_pwd}' ifname {WIFI_IFACE}"
+            ])
+            if r2 and r2.returncode==0:
+                time.sleep(2)
+                if is_internet_up():
+                    return True
+    return False
+
+def wpa_cli_try_autoconnect():
+    _run(["bash","-lc",f"wpa_cli -i {WIFI_IFACE} scan"])
+    time.sleep(2)
+    _run(["bash","-lc",f"wpa_cli -i {WIFI_IFACE} scan_results"])
+    time.sleep(2)
+
+def have_cmd(cmd):
+    try:
+        subprocess.run(
+            ["bash", "-lc", f"command -v {cmd} >/dev/null 2>&1"],
+            check=False
+        )
+        r = subprocess.run(["bash","-lc", f"command -v {cmd} >/dev/null 2>&1 && echo OK || echo NO"],
+                           capture_output=True, text=True)
+        return "OK" in (r.stdout or "")
+    except Exception:
+        return False
+
+def _clean_for_tts(text: str) -> str:
+    # Bikin pelafalan espeak lebih masuk akal
+    t = text
+    # Hindari bacaan aneh di singkatan/simbol
+    t = t.replace("Wi-Fi", "Wi Fi").replace("wifi", "Wi Fi").replace("WiFi", "Wi Fi")
+    t = t.replace("GPS", "G P S")
+    t = t.replace("&", " dan ")
+    # Tambah koma ringan agar jeda
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
+
+def say_offline(text):
+    """Ucapkan saat offline via espeak/espeak-ng TANPA shell quoting raw."""
+    if not ESPEAK_FALLBACK:
+        log("[VOICE-OFFLINE]", text)
+        return
+    spoken = _clean_for_tts(text)
+    try:
+        # Prefer espeak-ng jika ada (lebih baik dari espeak klasik)
+        if have_cmd("espeak-ng"):
+            # id+f2 biasanya lebih natural; jika tidak ada, espeak-ng fallback ke 'id'
+            subprocess.run(
+                ["espeak-ng", "-v", "id+f2", "-s", "150", "-p", "40", spoken],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False
+            )
+        else:
+            # espeak klasik
+            subprocess.run(
+                ["espeak", "-v", "id", "-s", "150", "-p", "40", spoken],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False
+            )
+    except Exception:
+        pass
+
+
+
+def ensure_network_blocking(max_minutes=5):
+    t0 = time.time()
+    if is_internet_up():
+        ssid = current_ssid()
+        network_ready.set()
+        return True
+
+    say_offline("Belum terhubung Wi-Fi. Mencari jaringan.")
+    secrets = load_wifi_secrets()
+    while (time.time() - t0) < max_minutes*60 and not network_ready.is_set():
+        nmcli_autoconnect_saved()
+        time.sleep(2)
+        if is_internet_up():
+            break
+
+        if nmcli_connect_with_secrets(secrets):
+            break
+
+        wpa_cli_try_autoconnect()
+        time.sleep(3)
+
+        if is_internet_up():
+            break
+
+        say_offline("Masih mencari jaringan Wi-Fi.")
+        time.sleep(4)
+
+    ok = is_internet_up()
+    if ok:
+        ssid = current_ssid() or ""
+        say_offline(f"Wi-Fi terhubung")
+        network_ready.set()
+        return True
+    else:
+        say_offline("Tidak ada internet. Sistem tetap berjalan terbatas.")
+        return False
 
 # ===== Kompas & IMU =====
-import smbus2  # I2C untuk HMC5883L & MPU6050
-
-# --- Alamat I2C & register (HMC5883L + MPU6050) ---
 I2C_BUS = 1
-# HMC5883L
 HMC_ADDR = 0x1E
 REG_CONFIG_A = 0x00
 REG_CONFIG_B = 0x01
 REG_MODE     = 0x02
 REG_X_MSB    = 0x03
 MODE_CONTINUOUS = 0x00
-# MPU6050
 MPU_ADDR = 0x68
 MPU_PWR_MGMT_1 = 0x6B
 MPU_ACCEL_XOUT_H = 0x3B
 
-# Kalibrasi magnetometer (silakan sesuaikan)
-OFFSET_X = 0.0
-OFFSET_Y = 0.0
-OFFSET_Z = 0.0
-SCALE_X  = 1.0
-SCALE_Y  = 1.0
-SCALE_Z  = 1.0
+OFFSET_X = OFFSET_Y = OFFSET_Z = 0.0
+SCALE_X  = SCALE_Y  = SCALE_Z  = 1.0
 
-# Parameter heading
 DECLINATION_DEG   = 0.0
 HEADING_ALPHA     = 0.25
 HEADING_BIAS_DEG  = 0.0
 AUTO_SET_BIAS_ON_START = True
-
-# Ambang arah benar/keluar
 ALIGN_OK_DEG      = 25.0
 ALIGN_EXIT_DEG    = 35.0
 ALIGN_STABLE_SEC  = 1.0
-
 INVERT_TURN       = False
+
+def _has_display():
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+def _has_gui_support():
+    try:
+        info = cv2.getBuildInformation()
+        return ("GUI:" in info) and (("GTK" in info) or ("Qt" in info))
+    except Exception:
+        return False
 
 class MPU6050:
     def _init_(self, bus_id=1, addr=MPU_ADDR):
@@ -94,8 +289,8 @@ class TiltCompass:
         self.bus = smbus2.SMBus(bus_id)
         self.addr = addr
         self._smooth = None
-        self.bus.write_byte_data(self.addr, REG_CONFIG_A, 0x70)  # 8avg,15Hz
-        self.bus.write_byte_data(self.addr, REG_CONFIG_B, 0xA0)  # Gain
+        self.bus.write_byte_data(self.addr, REG_CONFIG_A, 0x70)
+        self.bus.write_byte_data(self.addr, REG_CONFIG_B, 0xA0)
         self.bus.write_byte_data(self.addr, REG_MODE, MODE_CONTINUOUS)
         time.sleep(0.06)
         self.imu = MPU6050(bus_id=bus_id)
@@ -152,26 +347,29 @@ def rel_bearing_text(rel_brg):
 tilt_compass = None
 
 # ========================== CONFIG COMMON ==========================
-API_KEY = "REMOVED"
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+API_KEY = os.environ.get("HF_API_KEY", "")
 HF_BASE = "https://router.huggingface.co/v1"
 CHAT_MODEL = "openai/gpt-oss-20b:fireworks-ai"
+
 client_yolo = OpenAI(base_url=HF_BASE, api_key=API_KEY)
+
 
 SPEAK_INTERVAL = 5.0
 OSRM_TIMEOUT = 6
 REROUTE_GPS_TIMEOUT = 6
 
-# ====== GPS via GPIO UART ======
 GPS_PORT = "/dev/serial0"
 GPS_BAUD = 9600
 GPS_POWER_PIN = 17
-GPS_PPS_PIN   = 18
+GPS_PPS_PIN   = None
 
-# ====== Ultrasonic pins (BCM) ======
 TRIG_PIN = 23
 ECHO_PIN = 24
 
-# ====== FLAGS / LOCKS ======
 stop_event = threading.Event()
 ops_stop_event = threading.Event()
 ops_running = threading.Event()
@@ -181,11 +379,13 @@ dest_lock = threading.Lock()
 current_destination_name = None
 current_destination_coords = None  # (lat, lon)
 
-# Readiness flags
 yolo_ready = threading.Event()
 gps_ready = threading.Event()
 voice_ready = threading.Event()
 ultrasonic_ready = threading.Event()
+
+last_gps_fix = None
+OUTPUT_MAP_PATH = os.path.join(BASE_DIR, "route.html")
 
 # ========================== AUDIO (priority + preempt) ==========================
 import queue as _queue
@@ -201,12 +401,11 @@ def _set_current_proc(p):
     with _current_proc_lock:
         _current_proc = p
 
-def _get_current_proc():
-    with _current_proc_lock:
-        return _current_proc
-
 def tts_and_enqueue(text, priority=1):
     try:
+        if not network_ready.is_set():
+            say_offline(text)
+            return
         filename = f"/tmp/ai_tts_{uuid.uuid4().hex}.mp3"
         tts = gTTS(text=text, lang="id")
         tts.save(filename)
@@ -215,7 +414,8 @@ def tts_and_enqueue(text, priority=1):
             preempt_event.set()
         audio_queue.put((priority, filename))
     except Exception as e:
-        print(f"TTS enqueue error: {e}")
+        log(f"TTS enqueue error: {e}")
+        say_offline(text)
 
 def audio_player_worker():
     while True:
@@ -242,7 +442,7 @@ def audio_player_worker():
                     preempt_event.clear()
             audio_queue.task_done()
         except Exception as e:
-            print(f"Audio worker error: {e}")
+            log(f"Audio worker error: {e}")
 
 threading.Thread(target=audio_player_worker, daemon=True).start()
 
@@ -254,136 +454,111 @@ def gpio_setup_common():
         GPIO.setup(TRIG_PIN, GPIO.OUT)
         GPIO.setup(ECHO_PIN, GPIO.IN)
     except Exception as e:
-        print(f"[GPIO SETUP ERROR] {e}")
+        log(f"[GPIO SETUP ERROR] {e}")
 
 def gpio_gps_init():
     try:
         GPIO.setup(GPS_POWER_PIN, GPIO.OUT, initial=GPIO.HIGH)
-        print("[GPIO GPS POWER] ON (GPIO17 HIGH)")
+        log("[GPIO GPS POWER] ON (GPIO17 HIGH)")
     except Exception as e:
-        print(f"[GPIO GPS POWER] skip: {e}")
+        log(f"[GPIO GPS POWER] skip: {e}")
     try:
-        GPIO.setup(GPS_PPS_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-        GPIO.add_event_detect(GPS_PPS_PIN, GPIO.RISING, bouncetime=5)
-        print("[GPIO PPS] PPS detect aktif di GPIO18")
+        if GPS_PPS_PIN is not None:
+            GPIO.setup(GPS_PPS_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+            GPIO.add_event_detect(GPS_PPS_PIN, GPIO.RISING, bouncetime=5)
+            log(f"[GPIO PPS] PPS detect aktif di GPIO{GPS_PPS_PIN}")
+        else:
+            log("[GPIO PPS] dinonaktifkan")
     except Exception as e:
-        print(f"[GPIO PPS] skip: {e}")
+        log(f"[GPIO PPS] skip: {e}")
 
 def wait_pps(timeout=5):
+    if GPS_PPS_PIN is None:
+        return False
     t0 = time.time()
     try:
         while time.time()-t0 < timeout and not stop_event.is_set():
             if GPIO.event_detected(GPS_PPS_PIN):
-                print("[PPS] Edge terdeteksi.")
+                log("[PPS] Edge terdeteksi.")
                 return True
             time.sleep(0.05)
     except Exception:
         pass
     return False
 
-# ========================== GPS & Geocoding ==========================
-def get_gps_coordinates(timeout_total=30, debug=False):
-    try:
-        GPIO.output(GPS_POWER_PIN, GPIO.HIGH)
-    except Exception:
-        pass
+# ========================== Geocoding (rate-limit aware) ==========================
+HEADERS_WEB = {
+    "User-Agent": "RaspberryPi-Navigator/1.0 (contact: you@example.com)",
+    "Accept-Encoding": "gzip, deflate"
+}
+_last_geo_ts = 0.0
 
-    _ = wait_pps(timeout=3)
+def _rate_limit(min_interval=1.1):
+    global _last_geo_ts
+    wait = _last_geo_ts + min_interval - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    _last_geo_ts = time.time()
 
-    try:
-        ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=1)
-        if debug: print(f"[GPS] Buka {GPS_PORT} @ {GPS_BAUD}")
-    except Exception as e:
-        print(f"[GPS ERROR] Tidak bisa buka {GPS_PORT}: {e}")
-        return None
-
-    wanted = ("$GPGGA", "$GPRMC", "$GNGGA", "$GNRMC")
-    t0 = time.time()
-
-    while not stop_event.is_set() and not ops_stop_event.is_set():
-        if time.time() - t0 > timeout_total:
-            if debug: print("[GPS] Timeout total tanpa fix.")
-            return None
+def _get_json_with_retry(url, params, tries=3, timeout=10):
+    for i in range(tries):
         try:
-            line = ser.readline().decode("utf-8", errors="ignore").strip()
-        except Exception as e:
-            if debug: print(f"[GPS READ ERROR] {e}")
-            time.sleep(0.2); continue
-
-        if not line: continue
-        if debug and line.startswith(("$", "!")):
-            print("[GPS RAW]", line[:120])
-
-        if line.startswith(wanted):
-            try:
-                msg = pynmea2.parse(line)
-                lat, lon = getattr(msg, "latitude", None), getattr(msg, "longitude", None)
-                gps_qual = getattr(msg, "gps_qual", None)
-                status   = getattr(msg, "status", None)
-                if lat and lon and float(lat)!=0 and float(lon)!=0:
-                    ok = ((gps_qual is None and status is None) or
-                          (gps_qual and int(gps_qual)>0) or
-                          (status and status.upper()=="A"))
-                    if ok:
-                        gps_ready.set()
-                        return float(lat), float(lon)
-            except Exception as e:
-                if debug: print(f"[GPS PARSE ERROR] {e}")
+            _rate_limit()
+            r = requests.get(url, params=params, headers=HEADERS_WEB, timeout=timeout)
+            if r.status_code == 429:
+                log("[HTTP] 429 rate-limited, retry...")
+                time.sleep(2.0 * (i+1))
                 continue
-        time.sleep(0.05)
-
-def gps_warmup_worker():
-    print("🛰️  GPS warm-up worker aktif.")
-    while not stop_event.is_set():
-        if gps_ready.is_set():
-            time.sleep(5); continue
-        loc = get_gps_coordinates(timeout_total=15, debug=False)
-        if loc is not None:
-            if not gps_ready.is_set():
-                tts_and_enqueue("GPS siap.", priority=0)
-            gps_ready.set()
-            time.sleep(10)
-        else:
-            time.sleep(3)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            log(f"[HTTP ERROR try {i+1}/{tries}] {url} -> {e}")
+            if i == tries - 1:
+                return None
+            time.sleep(0.8 * (i+1))
+    return None
 
 def get_coordinates_from_name(place_name):
     url = "https://nominatim.openstreetmap.org/search"
     params = {"q": place_name, "format": "json", "limit": 1}
-    headers = {"User-Agent": "RaspberryPi-Navigator/1.0"}
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        data = r.json()
-        if data:
-            return float(data[0]["lat"]), float(data[0]["lon"])
-    except Exception as e:
-        print(f"[GEOCODE ERROR] {e}")
+    data = _get_json_with_retry(url, params, tries=3, timeout=10)
+    if data:
+        try:
+            lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
+            log(f"[GEOCODE] '{place_name}' -> {lat:.6f},{lon:.6f}")
+            return lat, lon
+        except Exception:
+            pass
+    log(f"[GEOCODE] Gagal untuk '{place_name}'")
     return None
 
 def reverse_geocode(lat, lon):
     url = "https://nominatim.openstreetmap.org/reverse"
     params = {"lat": lat, "lon": lon, "format": "jsonv2"}
-    headers = {"User-Agent": "RaspberryPi-Navigator/1.0"}
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        j = r.json()
-        name = j.get("name") or ""
-        display = j.get("display_name") or name
+    data = _get_json_with_retry(url, params, tries=3, timeout=10)
+    if data:
+        name = data.get("name") or ""
+        display = data.get("display_name") or name
         return display or f"{lat:.5f}, {lon:.5f}"
-    except Exception as e:
-        print(f"[REVERSE GEOCODE ERROR] {e}")
-        return f"{lat:.5f}, {lon:.5f}"
+    return f"{lat:.5f}, {lon:.5f}"
 
-# ========================== OSRM ==========================
-def osrm_route(orig, dest, profile="walking", timeout=OSRM_TIMEOUT):
-    base = "http://router.project-osrm.org/route/v1"
-    url = f"{base}/{profile}/{orig[1]},{orig[0]};{dest[1]},{dest[0]}?overview=full&geometries=geojson&steps=true"
-    try:
-        r = requests.get(url, timeout=timeout)
-        data = r.json()
-        if isinstance(data, dict) and data.get("routes"):
-            return data["routes"][0]
-    except Exception as e:
-        print(f"[OSRM {profile} ERROR] {e}")
+# ========================== OSRM (dengan retry) ==========================
+OSRM_BASE = "http://router.project-osrm.org/route/v1"
+
+def osrm_route(orig, dest, profile="walking", timeout=OSRM_TIMEOUT, tries=3):
+    url = f"{OSRM_BASE}/{profile}/{orig[1]},{orig[0]};{dest[1]},{dest[0]}?overview=full&geometries=geojson&steps=true"
+    last_err = None
+    for i in range(tries):
+        try:
+            r = requests.get(url, timeout=timeout, headers=HEADERS_WEB)
+            j = r.json()
+            if "routes" in j and j["routes"]:
+                return j["routes"][0]
+            last_err = f"No routes in response (status {r.status_code})"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(0.6 * (i+1))
+    log(f"[OSRM {profile}] gagal: {last_err}")
     return None
 
 def get_route_structured(orig, dest):
@@ -482,17 +657,70 @@ def speak_continue(dist_m):
     if dist_m > 20:
         tts_and_enqueue(f"Lanjut lurus {int(dist_m)} meter.", priority=1)
 
-# ========================== Map save ==========================
-def save_map(route_coords, orig, dest):
+# ========================== Map save (Leaflet, tanpa Folium) ==========================
+def save_map(route_coords, orig, dest, out_path=OUTPUT_MAP_PATH):
     try:
-        m = folium.Map(location=orig, zoom_start=16)
-        folium.Marker(orig, tooltip="Start (GPS)").add_to(m)
-        folium.Marker(dest, tooltip="Destination").add_to(m)
-        if route_coords:
-            folium.PolyLine(route_coords, color="blue", weight=5).add_to(m)
-        m.save("route.html")
+        def _fmt_pt(pt):
+            if not pt: return "null"
+            lat, lon = float(pt[0]), float(pt[1])
+            return f"[{lat:.6f}, {lon:.6f}]"
+
+        coords_js = ",".join(_fmt_pt(p) for p in (route_coords or []))
+        orig_js   = _fmt_pt(orig) if orig else "null"
+        dest_js   = _fmt_pt(dest) if dest else "null"
+
+        html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Route Preview</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+<style>html, body, #map {{ height: 100%; margin: 0; padding: 0; }}</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script>
+  const orig = {orig_js};
+  const dest = {dest_js};
+  const coords = [{coords_js}];
+
+  const center = orig || (coords.length ? coords[0] : dest) || [0,0];
+  const map = L.map('map').setView(center, 16);
+
+  L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors'
+  }}).addTo(map);
+
+  if (orig) L.marker(orig).addTo(map).bindTooltip('Start');
+  if (dest) L.marker(dest).addTo(map).bindTooltip('Destination');
+
+  let poly = null;
+  if (coords.length > 1) {{
+    poly = L.polyline(coords, {{ color: 'blue', weight: 5 }}).addTo(map);
+  }}
+
+  const group = [];
+  if (poly) group.push(poly);
+  if (orig) group.push(L.marker(orig));
+  if (dest) group.push(L.marker(dest));
+  if (group.length) {{
+    const bounds = L.featureGroup(group).getBounds().pad(0.15);
+    map.fitBounds(bounds);
+  }}
+</script>
+</body>
+</html>
+"""
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        log(f"[MAP] Tersimpan: {out_path}")
     except Exception as e:
-        print(f"[MAP ERROR] {e}")
+        log(f"[MAP ERROR] {e}")
 
 # ========================== NAV: destination & main loop ==========================
 def update_destination(dest_name):
@@ -506,35 +734,32 @@ def update_destination(dest_name):
         current_destination_coords = coords
         nav_update_event.set()
     tts_and_enqueue(f"Siap. Navigasi ke {dest_name} disiapkan.", priority=0)
+    log(f"[DEST] {dest_name} -> {coords}")
     return True
+
+def _ema(prev, new, alpha=0.2):
+    return new if prev is None else (prev*(1-alpha) + new*alpha)
 
 def navigate_with_turn_triggers(poly, mans, cancel_event=None):
     if not mans:
         tts_and_enqueue("Rute tidak tersedia.", priority=1)
         return
 
-    FAR = 180.0
     NEAR_TRIGGER = 60.0
     NOW_TRIGGER  = 7.0
-    CONTINUE_GAP = 120.0
-
     MIN_TURN_AHEAD_M = 15.0
     OFFROUTE_BASE = 60.0
     OFFROUTE_STREAK_NEED = 6
     START_GRACE_SEC = 20.0
-    RECLAC_MIN_SECS = 10.0
 
     idx = 0
-    last_continue_say = 0.0
     last_recalc = 0.0
 
     start_ts = time.time()
     recent_pts = deque(maxlen=6)
     offroute_streak = 0
-
     spoken_far = set()
     spoken_now = set()
-
     final_loc = mans[-1]["loc"]
 
     align_state_aligned = False
@@ -555,17 +780,24 @@ def navigate_with_turn_triggers(poly, mans, cancel_event=None):
         d = [meters(p, c) for p in pts]
         return sum(d) / len(d)
 
+    tts_and_enqueue("Navigasi dimulai.", priority=1)
+    log("[NAV] Navigasi dimulai.")
+
     while not stop_event.is_set() and not (cancel_event and cancel_event.is_set()):
         cur = get_gps_coordinates(timeout_total=5, debug=False)
         if cur is None:
-            time.sleep(0.5)
-            continue
+            if last_gps_fix is None:
+                tts_and_enqueue("GPS belum siap, mencari sinyal.", priority=1)
+                time.sleep(1.0)
+                continue
+            cur = last_gps_fix
 
         recent_pts.append(cur)
         cur_smooth = _avg_point(recent_pts) if len(recent_pts) >= 3 else cur
 
         if meters(cur_smooth, final_loc) <= NOW_TRIGGER:
             tts_and_enqueue("Tiba di tujuan.", priority=1)
+            log("[NAV] Selesai: tiba di tujuan.")
             return
 
         if idx >= len(mans):
@@ -619,10 +851,7 @@ def navigate_with_turn_triggers(poly, mans, cancel_event=None):
 
         if dcur <= max(NEAR_TRIGGER, MIN_TURN_AHEAD_M) and idx not in spoken_far:
             ahead_dist = max(MIN_TURN_AHEAD_M, int(round(dcur)))
-            if is_turn:
-                speak_ahead(ahead_dist, base)
-            else:
-                speak_ahead(max(5, int(round(dcur / 5) * 5)), base)
+            speak_ahead(ahead_dist, base)
             spoken_far.add(idx)
 
         if dcur <= NOW_TRIGGER and idx not in spoken_now:
@@ -637,8 +866,9 @@ def navigate_with_turn_triggers(poly, mans, cancel_event=None):
             else:
                 offroute_streak = 0
             if (offroute_streak >= OFFROUTE_STREAK_NEED and
-                (time.time() - last_recalc) > RECLAC_MIN_SECS):
+                (time.time() - last_recalc) > 10.0):
                 tts_and_enqueue("Rute diubah, menghitung ulang.", priority=1)
+                log("[NAV] Off-route -> re-route")
                 last_recalc = time.time()
                 return "REROUTE"
 
@@ -654,8 +884,76 @@ def navigate_with_turn_triggers(poly, mans, cancel_event=None):
 
         time.sleep(0.5)
 
+# ========================== GPS ==========================
+def get_gps_coordinates(timeout_total=30, debug=False):
+    global last_gps_fix
+    try:
+        GPIO.output(GPS_POWER_PIN, GPIO.HIGH)
+    except Exception:
+        pass
+
+    _ = wait_pps(timeout=3)
+
+    try:
+        ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=1)
+        if debug: log(f"[GPS] Buka {GPS_PORT} @ {GPS_BAUD}")
+    except Exception as e:
+        log(f"[GPS ERROR] Tidak bisa buka {GPS_PORT}: {e}")
+        return None
+
+    wanted = ("$GPGGA", "$GPRMC", "$GNGGA", "$GNRMC")
+    t0 = time.time()
+
+    while not stop_event.is_set() and not ops_stop_event.is_set():
+        if time.time() - t0 > timeout_total:
+            if debug: log("[GPS] Timeout total tanpa fix.")
+            return None
+        try:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+        except Exception as e:
+            if debug: log(f"[GPS READ ERROR] {e}")
+            time.sleep(0.2); continue
+
+        if not line: continue
+        if debug and line.startswith(("$", "!")):
+            log("[GPS RAW]", line[:120])
+
+        if line.startswith(wanted):
+            try:
+                msg = pynmea2.parse(line)
+                lat, lon = getattr(msg, "latitude", None), getattr(msg, "longitude", None)
+                gps_qual = getattr(msg, "gps_qual", None)
+                status   = getattr(msg, "status", None)
+                if lat and lon and float(lat)!=0 and float(lon)!=0:
+                    ok = ((gps_qual is None and status is None) or
+                          (gps_qual and int(gps_qual)>0) or
+                          (status and status.upper()=="A"))
+                    if ok:
+                        last_gps_fix = (float(lat), float(lon))
+                        gps_ready.set()
+                        return last_gps_fix
+            except Exception as e:
+                if debug: log(f"[GPS PARSE ERROR] {e}")
+                continue
+        time.sleep(0.05)
+
+def gps_warmup_worker():
+    log("🛰️  GPS warm-up worker aktif.")
+    while not stop_event.is_set():
+        if gps_ready.is_set():
+            time.sleep(5); continue
+        loc = get_gps_coordinates(timeout_total=15, debug=False)
+        if loc is not None:
+            if not gps_ready.is_set():
+                tts_and_enqueue("GPS siap.", priority=0)
+            gps_ready.set()
+            time.sleep(10)
+        else:
+            time.sleep(3)
+
+# ========================== NAV WORKER ==========================
 def gps_nav_worker(cancel_event=None):
-    print("📡 GPS Navigation worker aktif (standby). Ucapkan 'menuju ...' lalu 'mulai' untuk menyalakan navigasi.")
+    log("📡 GPS Navigation worker aktif (standby). Ucapkan 'menuju ...' lalu 'mulai' untuk menyalakan navigasi.")
     last_poly = None
     last_mans = None
     auto_bias_done = False
@@ -672,8 +970,10 @@ def gps_nav_worker(cancel_event=None):
             dest_coords = current_destination_coords
             nav_update_event.clear()
 
+        save_map(route_coords=[], orig=last_gps_fix, dest=dest_coords)
+
         while not stop_event.is_set() and not (cancel_event and cancel_event.is_set()):
-            cur = get_gps_coordinates(timeout_total=30, debug=False)
+            cur = get_gps_coordinates(timeout_total=30, debug=False) or last_gps_fix
             if cur is None:
                 tts_and_enqueue("GPS belum siap, mencari sinyal satelit.", priority=1)
                 time.sleep(2)
@@ -681,12 +981,15 @@ def gps_nav_worker(cancel_event=None):
 
             poly, mans = get_route_structured(cur, dest_coords)
             if not mans:
-                tts_and_enqueue("Gagal menghitung rute.", priority=1)
+                tts_and_enqueue("Gagal menghitung rute, mencoba lagi.", priority=1)
+                log("[ROUTE] kosong. Coba lagi 3 detik...")
+                save_map([], cur, dest_coords)
+                time.sleep(3)
                 break
 
             last_poly, last_mans = poly, mans
-            try: save_map(poly, cur, dest_coords)
-            except Exception: pass
+            save_map(poly, cur, dest_coords)
+            log(f"[ROUTE] langkah: {len(mans)}")
 
             try:
                 if AUTO_SET_BIAS_ON_START and (not auto_bias_done) and tilt_compass is not None and mans:
@@ -724,12 +1027,12 @@ def gps_nav_worker(cancel_event=None):
                             "loc": loc, "distance": dist
                         })
                 last_poly, last_mans = poly, mans
-                try: save_map(poly, cur2, dest_coords)
-                except Exception: pass
+                save_map(poly, cur2, dest_coords)
             else:
-                tts_and_enqueue("Jaringan lambat, menggunakan rute sebelumnya.", priority=1)
+                tts_and_enqueue("Jaringan lambat, pakai rute sebelumnya.", priority=1)
                 if last_poly and last_mans:
                     poly, mans = last_poly, last_mans
+                    save_map(poly, cur2, dest_coords)
                 else:
                     break
             continue
@@ -760,7 +1063,7 @@ def get_distance():
         if distance > 0: ultrasonic_ready.set()
         return distance
     except Exception as e:
-        print(f"[ULTRASONIC ERROR] {e}")
+        log(f"[ULTRASONIC ERROR] {e}")
         return None
 
 # ========================== Chat / AI Prompt ==========================
@@ -770,8 +1073,7 @@ messages = [
      "content": ("Kamu adalah asisten navigasi untuk orang buta. "
                  "Selalu bicara singkat: sebutkan objek, jarak, dan cara menghindar. "
                  "Jangan berbasa-basi, jangan menjelaskan panjang. "
-                 "Contoh: 'Orang di depan 80 cm, geser kiri.' "
-                 "atau 'Mobil di depan 40 cm, berhenti.' "
+                 "Contoh: 'Orang di depan 80 cm, geser kiri.' atau 'Mobil di depan 40 cm, berhenti.' "
                  "Dahulukan instruksi dibanding percakapan.")}
 ]
 
@@ -786,27 +1088,38 @@ def ask_ai(user_text):
         messages.append({"role": "assistant", "content": bot_reply})
         return bot_reply
     except Exception as e:
-        print(f"[AI ERROR] {e}")
+        log(f"[AI ERROR] {e}")
         return "Maaf, terjadi kesalahan."
 
 # ========================== YOLO FAST (Ultralytics) ==========================
-from ultralytics import YOLO
 from threading import Thread, Lock
 
-MODEL_PATH   = "models/my_model.pt"   # <<< sesuai permintaan kamu
+# semula:
+# MODEL_PATH   = "models/my_model.pt"
+# OUTPUT_MAP_PATH = "route.html"
+
+# ganti jadi:
+MODEL_PATH = os.path.join(BASE_DIR, "models", "my_model.pt")
+
 IMG_SIZE     = 320
 CONF_THRES   = 0.50
 MAX_DET      = 20
-FRAME_SKIP   = 2
+
+FRAME_SKIP         = 2
+AUTO_FRAME_SKIP    = True
+TARGET_FPS_DISPLAY = 12.0
+MAX_FRAME_SKIP     = 6
+MIN_FRAME_SKIP     = 0
+
 DEVICE       = "cpu"
 CPU_THREADS  = 2
 
-# ===== Kamera (V4L2 /dev/video0 – TANPA libcamera) =====
 CAM_SRC      = 0
 CAM_WIDTH    = 640
 CAM_HEIGHT   = 480
 CAM_FPS_HINT = 30
 USE_MJPG     = True
+
 SHOW_WINDOW  = True
 MIN_CONFIDENCE = CONF_THRES
 
@@ -818,12 +1131,12 @@ def set_cpu_threads(n: int):
     os.environ["VECLIB_MAXIMUM_THREADS"] = str(n)
     os.environ["NUMEXPR_NUM_THREADS"] = str(n)
     try:
+        import torch
         torch.set_num_threads(n)
     except Exception:
         pass
 
 class CamReader:
-    """Threaded camera reader (V4L2 /dev/video0, tanpa libcamera)."""
     def _init_(self, src=0, width=640, height=480, fps=30, use_mjpg=True):
         self.cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
         if use_mjpg:
@@ -835,10 +1148,8 @@ class CamReader:
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
-
         if not self.cap.isOpened():
-            raise RuntimeError("Kamera tidak bisa dibuka! Pastikan /dev/video0 ada (aktifkan bcm2835-v4l2).")
-
+            raise RuntimeError("Kamera tidak bisa dibuka! Cek CAM_SRC / izin perangkat.")
         self.ok = True
         self.frame = None
         self.lock = Lock()
@@ -887,10 +1198,12 @@ def draw_boxes(frame, results, names, thickness=2):
     return frame
 
 def yolo_detection(cancel_event=None):
+    global FRAME_SKIP
     try:
         set_cpu_threads(CPU_THREADS)
+        from ultralytics import YOLO
 
-        print("[YOLO] Memuat model:", MODEL_PATH)
+        log("[YOLO] Memuat model:", MODEL_PATH)
         model = YOLO(MODEL_PATH)
 
         names = {}
@@ -909,27 +1222,31 @@ def yolo_detection(cancel_event=None):
 
         last_results = None
         frame_id = 0
-        fps_hist = deque(maxlen=20)
-        last_announced = 0.0
+        disp_fps_ema = None
+        infer_ms_ema = None
+        last_disp_ts = time.time()
 
-        if SHOW_WINDOW:
+        use_window = SHOW_WINDOW and _has_display() and _has_gui_support()
+        if use_window:
             try: cv2.namedWindow("YOLO Detection", cv2.WINDOW_NORMAL)
-            except Exception: pass
+            except Exception: use_window = False
 
         while not stop_event.is_set() and not (cancel_event and cancel_event.is_set()):
             ok, frame = cam.read()
             if not ok or frame is None:
-                time.sleep(0.005); continue
+                time.sleep(0.003); continue
 
-            if frame_id % max(1, FRAME_SKIP) == 0:
+            do_infer = (frame_id % max(1, FRAME_SKIP + 1) == 0)
+
+            if do_infer:
                 t0 = time.time()
                 results = model.predict(
                     frame, imgsz=IMG_SIZE, conf=CONF_THRES,
                     max_det=MAX_DET, device=DEVICE, verbose=False
                 )
                 last_results = results
-                fps = 1.0 / max(1e-6, (time.time() - t0))
-                fps_hist.append(fps)
+                infer_ms = (time.time() - t0) * 1000.0
+                infer_ms_ema = _ema(infer_ms_ema, infer_ms, 0.25)
 
                 counts = {}
                 positions = {}
@@ -953,53 +1270,70 @@ def yolo_detection(cancel_event=None):
                         counts[name] = counts.get(name, 0) + 1
                         positions[name] = pos
 
-                if counts and (time.time() - last_announced) >= SPEAK_INTERVAL:
-                    parts = []
-                    for k, v in counts.items():
-                        pos = positions.get(k, "")
-                        obj = f"{v} {k}" if v > 1 else k
-                        if pos: obj += f" di {pos}"
-                        parts.append(obj)
-                    summary = ", ".join(parts)
-
-                    instr = ""
-                    if "kanan" in positions.values(): instr = "Hindari ke kiri."
-                    elif "kiri" in positions.values(): instr = "Hindari ke kanan."
-                    elif "tengah" in positions.values(): instr = "Hati-hati di depan."
-
+                if counts:
                     jarak = get_distance()
                     if jarak is not None and jarak < 200:
+                        parts = []
+                        for k, v in counts.items():
+                            pos = positions.get(k, "")
+                            obj = f"{v} {k}" if v > 1 else k
+                            if pos: obj += f" di {pos}"
+                            parts.append(obj)
+                        summary = ", ".join(parts)
+                        instr = ""
+                        if "kanan" in positions.values(): instr = "Silahkan ke kiri."
+                        elif "kiri" in positions.values(): instr = "Silahkan ke kanan."
+                        elif "tengah" in positions.values(): instr = "Hati-hati di depan."
                         prompt = (f"Ada {summary}, jaraknya sekitar {int(jarak)} centimeter. "
                                   f"{instr} Sebutkan informasi itu dengan gaya singkat alami.")
-                        bot_reply = ask_ai(prompt)
-                        clean = bot_reply.replace("*","").replace("\n"," ").replace("_"," ").strip()
-                        print(f"[AI] {clean}")
+                        try:
+                            reply = ask_ai(prompt)
+                            clean = reply.replace("*","").replace("\n"," ").replace("_"," ").strip()
+                        except Exception:
+                            clean = f"{summary}. Jarak {int(jarak)} cm. {instr}"
+                        log(f"[AI] {clean}")
                         tts_and_enqueue(clean, priority=0)
-                        last_announced = time.time()
 
             if last_results is not None:
                 frame = draw_boxes(frame, last_results, names, thickness=2)
 
-            if fps_hist:
-                fps_disp = sum(fps_hist) / len(fps_hist)
-                cv2.putText(frame, f"FPS~{fps_disp:.1f} (skip={FRAME_SKIP})",
-                            (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+            now = time.time()
+            dt = now - last_disp_ts
+            if dt > 0:
+                disp_fps = 1.0 / dt
+                disp_fps_ema = _ema(disp_fps_ema, disp_fps, 0.2)
+            last_disp_ts = now
 
-            if SHOW_WINDOW:
+            if AUTO_FRAME_SKIP and disp_fps_ema is not None:
+                if disp_fps_ema < TARGET_FPS_DISPLAY * 0.9 and FRAME_SKIP < MAX_FRAME_SKIP:
+                    FRAME_SKIP += 1
+                elif disp_fps_ema > TARGET_FPS_DISPLAY * 1.2 and FRAME_SKIP > MIN_FRAME_SKIP:
+                    FRAME_SKIP -= 1
+
+            if disp_fps_ema is not None:
+                cv2.putText(frame, f"FPS~{disp_fps_ema:.1f}  skip={FRAME_SKIP}  infer~{(infer_ms_ema or 0):.0f}ms",
+                            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+            if use_window:
                 try:
                     cv2.imshow("YOLO Detection", frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
                         if cancel_event: cancel_event.set()
                         break
+                    elif key in (ord(']'), ord('=')):
+                        FRAME_SKIP = min(MAX_FRAME_SKIP, FRAME_SKIP + 1)
+                    elif key in (ord('['), ord('-')):
+                        FRAME_SKIP = max(MIN_FRAME_SKIP, FRAME_SKIP - 1)
                 except Exception:
-                    pass
+                    use_window = False
             else:
                 time.sleep(0.001)
 
             frame_id += 1
 
     except Exception as e:
-        print(f"[YOLO ERROR] {e}")
+        log(f"[YOLO ERROR] {e}")
     finally:
         try: cam.release()
         except Exception: pass
@@ -1011,7 +1345,6 @@ t_nav = None
 t_yolo = None
 
 def start_ops():
-    """Mulai operasi berat: YOLO + GPS Nav. Dipanggil saat 'mulai'."""
     global t_nav, t_yolo
     if ops_running.is_set():
         tts_and_enqueue("Operasi sudah berjalan.", priority=0)
@@ -1028,7 +1361,6 @@ def start_ops():
     tts_and_enqueue("Operasi dimulai. Deteksi objek dan navigasi aktif.", priority=0)
 
 def stop_ops():
-    """Hentikan operasi berat, tetap sisakan STT+LLM+TTS."""
     global t_nav, t_yolo
     if not ops_running.is_set():
         tts_and_enqueue("Operasi sudah berhenti. Mode siaga.", priority=0)
@@ -1046,11 +1378,6 @@ def stop_ops():
     tts_and_enqueue("Operasi dihentikan. Sistem kembali ke mode siaga.", priority=0)
 
 def handle_voice_command(text):
-    """
-    Intent 0: kontrol → 'mulai', 'stop', 'berhenti'
-    Intent 1: lokasi → 'lokasi saya di mana', 'di mana saya sekarang', 'saya ada di mana'
-    Intent 2: tujuan → 'menuju ...', 'ke ...', 'arah ke ...', 'tujuan ...'
-    """
     t = text.lower().strip()
 
     if re.search(r"^(mulai|start|aktifkan)$", t):
@@ -1059,7 +1386,7 @@ def handle_voice_command(text):
         stop_ops(); return True
 
     if re.search(r"(lokasi saya|di mana saya|saya ada di mana)", t):
-        loc = get_gps_coordinates(timeout_total=15, debug=False)
+        loc = get_gps_coordinates(timeout_total=15, debug=False) or last_gps_fix
         if loc is None:
             tts_and_enqueue("GPS belum siap, mencari sinyal satelit.", priority=0)
             return True
@@ -1071,44 +1398,126 @@ def handle_voice_command(text):
     if m:
         dest_name = m.group(2).strip()
         if dest_name:
-            update_destination(dest_name)
-            if not ops_running.is_set():
+            ok = update_destination(dest_name)
+            if ok and not ops_running.is_set():
                 tts_and_enqueue("Tujuan disimpan. Ucapkan 'mulai' untuk memulai navigasi.", priority=0)
             return True
     return False
+    
+
+# ====== MIC PICKER (untuk SpeechRecognition) ======
+MIC_NAME = os.environ.get("MIC_NAME", "").strip()
+
+def pick_mic_device_index(prefer_name: str = MIC_NAME):
+    """Pilih index microphone untuk SpeechRecognition.
+    - Jika MIC_NAME (env) di-set, cocokkan substring (case-insensitive).
+    - Jika tidak, fallback cari nama yang mengandung 'usb'/'mic'/'headset'/'camera'.
+    - Terakhir pakai index 0.
+    """
+    try:
+        import speech_recognition as sr
+        names = sr.Microphone.list_microphone_names()
+    except Exception as e:
+        log(f"[MIC] Gagal list microphone: {e}")
+        return None
+
+    if not names:
+        log("[MIC] Tidak ada microphone terdeteksi.")
+        return None
+
+    # 1) Cocokkan dengan preferensi dari env MIC_NAME
+    if prefer_name:
+        for i, nm in enumerate(names):
+            if prefer_name.lower() in (nm or "").lower():
+                log(f"[MIC] Pilih index {i}: {nm} (match MIC_NAME)")
+                return i
+
+    # 2) Fallback: cari kandidat umum
+    for i, nm in enumerate(names):
+        low = (nm or "").lower()
+        if any(k in low for k in ["usb", "mic", "headset", "camera"]):
+            log(f"[MIC] Fallback index {i}: {nm}")
+            return i
+
+    # 3) Fallback terakhir
+    log(f"[MIC] Pakai index 0: {names[0]}")
+    return 0
+
+
 
 def voice_listener_worker():
+    import speech_recognition as sr
     r = sr.Recognizer()
-    r.dynamic_energy_threshold = False
-    r.energy_threshold = 2500
-    r.pause_threshold = 0.6
+    r.dynamic_energy_threshold = True
+    r.energy_threshold = 400
+    r.pause_threshold = 0.5
     r.non_speaking_duration = 0.2
 
-    mic = sr.Microphone(sample_rate=16000)
-    with mic as source:
-        r.adjust_for_ambient_noise(source, duration=1)
-        print("[VOICE] Mendengarkan mic (mode siaga)...")
-        voice_ready.set()
-        tts_and_enqueue("Sistem siap. Ucapkan 'mulai' untuk menyalakan deteksi dan navigasi, atau 'stop' untuk berhenti.", priority=0)
+    log("[VOICE] Worker start. Mencari microphone...")
+
     while not stop_event.is_set():
+        mic_index = pick_mic_device_index()
+        if mic_index is None:
+            time.sleep(3)
+            continue
+
         try:
-            with mic as source:
-                print("[VOICE] Silakan bicara...")
-                audio = r.listen(source, timeout=6, phrase_time_limit=8)
+            mic = sr.Microphone(sample_rate=44100, device_index=mic_index)
+
+            # coba kalibrasi sebentar; kalau bug AttributeError muncul, retry
             try:
-                query = r.recognize_google(audio, language="id-ID")
-                print(f"[VOICE INPUT] {query}")
-                if handle_voice_command(query):
+                with mic as source:
+                    r.adjust_for_ambient_noise(source, duration=0.5)
+                if not voice_ready.is_set():
+                    log("[VOICE] Mic siap. Mode siaga...")
+                    tts_and_enqueue("Sistem siap. Ucapkan 'mulai' untuk menyalakan deteksi dan navigasi, atau 'stop' untuk berhenti.", priority=0)
+                    voice_ready.set()
+            except AttributeError:
+                log("[VOICE] PyAudio stream gagal buka (AttributeError). Retry 3 detik...")
+                time.sleep(3)
+                continue
+            except OSError as e:
+                log(f"[VOICE] Mic open error: {e}. Retry 3 detik...")
+                time.sleep(3)
+                continue
+
+            # dengar per-siklus agar device tidak ‘busy’ terus
+            while not stop_event.is_set():
+                try:
+                    with sr.Microphone(sample_rate=16000, device_index=mic_index) as source:
+                        log("[VOICE] Silakan bicara...")
+                        audio = r.listen(source, timeout=6, phrase_time_limit=8)
+                except AttributeError:
+                    log("[VOICE] AttributeError saat open/listen. Retry...")
+                    time.sleep(2)
+                    break
+                except sr.WaitTimeoutError:
                     continue
-                reply = ask_ai(query)
-                clean = reply.replace("*","").replace("_"," ").replace("\n"," ").strip()
-                tts_and_enqueue(clean, priority=0)
-            except sr.UnknownValueError:
-                print("[VOICE] Tidak terdengar jelas...")
-            except sr.RequestError as e:
-                print(f"[VOICE ERROR] {e}")
-        except Exception:
-            time.sleep(1)
+                except OSError as e:
+                    log(f"[VOICE] OSError saat listen: {e}. Re-init mic...")
+                    time.sleep(2)
+                    break
+
+                try:
+                    query = r.recognize_google(audio, language="id-ID")
+                    log(f"[VOICE INPUT] {query}")
+                    if handle_voice_command(query):
+                        continue
+                    reply = ask_ai(query)
+                    clean = reply.replace("*","").replace("_"," ").replace("\n"," ").strip()
+                    tts_and_enqueue(clean, priority=0)
+                except sr.UnknownValueError:
+                    log("[VOICE] Tidak terdengar jelas...")
+                except sr.RequestError as e:
+                    log(f"[VOICE ERROR] STT request: {e}")
+                except Exception as e:
+                    log(f"[VOICE] Error lain: {e}")
+
+        except Exception as e:
+            log(f"[VOICE] Fatal saat init mic: {e}")
+            time.sleep(3)
+            continue
+
 
 # ========================== READINESS MONITOR ==========================
 def readiness_monitor():
@@ -1128,15 +1537,22 @@ def readiness_monitor():
 # ========================== MAIN ==========================
 if _name_ == "_main_":
     try:
+        ok_net = ensure_network_blocking(max_minutes=5)
+        if ok_net:
+    	# Setelah internet stabil, gTTS ikut ngomong (sama kalimat)
+            tts_and_enqueue("Wi-Fi terhubung", priority=0)
+
+
+
         gpio_setup_common()
         gpio_gps_init()
 
         try:
             tilt_compass = TiltCompass(bus_id=I2C_BUS, addr=HMC_ADDR)
-            print("[COMPASS] TiltCompass aktif.")
+            log("[COMPASS] TiltCompass aktif.")
         except Exception as e:
             tilt_compass = None
-            print(f"[COMPASS WARN] Kompas tidak tersedia: {e}")
+            log(f"[COMPASS WARN] Kompas tidak tersedia: {e}")
 
         t_voice = threading.Thread(target=voice_listener_worker, daemon=True)
         t_ready = threading.Thread(target=readiness_monitor, daemon=True)
@@ -1145,9 +1561,6 @@ if _name_ == "_main_":
         t_voice.start()
         t_ready.start()
         t_gpswu.start()
-
-        # OPTIONAL: pre-set destination
-        # update_destination("SMA Negeri 1 Sukabumi")
 
         while not stop_event.is_set():
             time.sleep(0.5)
