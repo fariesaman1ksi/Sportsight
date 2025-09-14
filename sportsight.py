@@ -347,15 +347,56 @@ def rel_bearing_text(rel_brg):
 tilt_compass = None
 
 # ========================== CONFIG COMMON ==========================
-import os
-from dotenv import load_dotenv
-load_dotenv()
+# ========================== CONFIG COMMON ==========================
+# BYPASS Hugging Face Router → langsung ke Fireworks
+FIREWORKS_BASE = "https://api.fireworks.ai/inference/v1"
+FIREWORKS_API_KEY = "fw_3ZjP5fiTZZsUarrv51MgYV7d"  # <-- taruh key kamu di sini
 
-API_KEY = os.environ.get("HF_API_KEY", "")
-HF_BASE = "https://router.huggingface.co/v1"
-CHAT_MODEL = "openai/gpt-oss-20b:fireworks-ai"
+CHAT_MODEL = "accounts/fireworks/models/gpt-oss-20b"    # model TETAP sama
+client_yolo = OpenAI(base_url=FIREWORKS_BASE, api_key=FIREWORKS_API_KEY)
 
-client_yolo = OpenAI(base_url=HF_BASE, api_key=API_KEY)
+# ==== LLM THROTTLE / COOLDOWN (tambahan) ====
+AI_DISABLED_UNTIL = 0.0
+LLM_MIN_INTERVAL_SEC = 4.0
+_last_llm_ts = 0.0
+_last_llm_text = ""
+
+def ask_ai_throttled(user_text):
+    global AI_DISABLED_UNTIL, _last_llm_ts, _last_llm_text
+    now = time.time()
+
+    # cooldown aktif → fallback
+    if now < AI_DISABLED_UNTIL:
+        return None
+
+    # dedup + rate limit
+    if user_text.strip() == _last_llm_text.strip() and (now - _last_llm_ts) < (LLM_MIN_INTERVAL_SEC * 2):
+        return None
+    if (now - _last_llm_ts) < LLM_MIN_INTERVAL_SEC:
+        return None
+
+    try:
+        with messages_lock:
+            messages.append({"role": "user", "content": user_text})
+        resp = client_yolo.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=64,
+        )
+        bot = resp.choices[0].message.content
+        with messages_lock:
+            messages.append({"role": "assistant", "content": bot})
+        _last_llm_ts = now
+        _last_llm_text = user_text
+        return bot
+    except Exception as e:
+        msg = str(e)
+        log(f"[AI ERROR] {msg}")
+        # 429 → cooldown 45 detik
+        if "429" in msg or "rate limit" in msg.lower():
+            AI_DISABLED_UNTIL = time.time() + 45
+        return None
 
 
 SPEAK_INTERVAL = 5.0
@@ -395,6 +436,7 @@ yolo_active = threading.Event()
 
 _current_proc_lock = threading.Lock()
 _current_proc = None
+playback_active = threading.Event()  # <--- tambahan untuk cegah rebutan audio
 
 def _set_current_proc(p):
     global _current_proc
@@ -424,6 +466,7 @@ def audio_player_worker():
             if filepath is None:
                 break
             if os.path.exists(filepath):
+                playback_active.set()  # <--- set flag saat playback dimulai
                 proc = subprocess.Popen(["mpg123", "-q", filepath])
                 _set_current_proc(proc)
                 while proc.poll() is None:
@@ -440,6 +483,7 @@ def audio_player_worker():
                 if pr == 0:
                     yolo_active.clear()
                     preempt_event.clear()
+                playback_active.clear()  # <--- clear flag setelah playback selesai
             audio_queue.task_done()
         except Exception as e:
             log(f"Audio worker error: {e}")
@@ -1287,8 +1331,10 @@ def yolo_detection(cancel_event=None):
                         prompt = (f"Ada {summary}, jaraknya sekitar {int(jarak)} centimeter. "
                                   f"{instr} Sebutkan informasi itu dengan gaya singkat alami.")
                         try:
-                            reply = ask_ai(prompt)
-                            clean = reply.replace("*","").replace("\n"," ").replace("_"," ").strip()
+                            # GANTI: gunakan versi throttled
+                            reply = ask_ai_throttled(prompt)
+                            clean = (f"{summary}. Jarak {int(jarak)} cm. {instr}"
+                                     if not reply else reply.replace("*","").replace("\n"," ").replace("_"," ").strip())
                         except Exception:
                             clean = f"{summary}. Jarak {int(jarak)} cm. {instr}"
                         log(f"[AI] {clean}")
@@ -1484,6 +1530,11 @@ def voice_listener_worker():
             # dengar per-siklus agar device tidak ‘busy’ terus
             while not stop_event.is_set():
                 try:
+                    # tahan saat sedang playback untuk hindari rebutan device
+                    if playback_active.is_set():
+                        time.sleep(0.1)
+                        continue
+
                     with sr.Microphone(sample_rate=16000, device_index=mic_index) as source:
                         log("[VOICE] Silakan bicara...")
                         audio = r.listen(source, timeout=6, phrase_time_limit=8)
@@ -1501,6 +1552,8 @@ def voice_listener_worker():
                 try:
                     query = r.recognize_google(audio, language="id-ID")
                     log(f"[VOICE INPUT] {query}")
+                    if len(query.strip()) < 2:
+                        continue
                     if handle_voice_command(query):
                         continue
                     reply = ask_ai(query)
@@ -1539,10 +1592,8 @@ if _name_ == "_main_":
     try:
         ok_net = ensure_network_blocking(max_minutes=5)
         if ok_net:
-    	# Setelah internet stabil, gTTS ikut ngomong (sama kalimat)
+            # Setelah internet stabil, gTTS ikut ngomong (sama kalimat)
             tts_and_enqueue("Wi-Fi terhubung", priority=0)
-
-
 
         gpio_setup_common()
         gpio_gps_init()
