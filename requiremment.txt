@@ -1,6 +1,7 @@
 streamlit
-pandas
 folium
+pandas
+requests
 gtts
 SpeechRecognition
-requests
+
